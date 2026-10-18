@@ -1,0 +1,11 @@
+# WiFi credentials, written by the desktop WiFi Connector.
+# Never commit this — secrets.h.example is the template that is tracked.
+secrets.h
+crx_pulse/secrets.h
+crx_pulse_test/secrets.h
+
+# Arduino build output
+build/
+*.bin
+*.elf
+*.map

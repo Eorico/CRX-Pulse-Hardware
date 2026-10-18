@@ -1,1440 +1,1704 @@
 /**
- * CRX-Pulse — Complete Production Firmware (Single File) v6.0.0
+ * =====================================================================
+ *  CRX-Pulse — PRODUCTION FIRMWARE (crx_pulse.ino)
+ * =====================================================================
  *
- * This revision implements honest, per-sensor connection tracking:
- * every sensor (pH, turbidity, ammonia, water level, water temp,
- * ambient temp) is validated INDEPENDENTLY before being included in
- * what's sent to the backend. A disconnected/invalid sensor is
- * OMITTED from the payload entirely - never sent as a fabricated
- * default, a stale value, or a clamped-into-range number pretending
- * to be real.
+ *  Built from the calibrated bench sketch (crx_pulse_test.ino — same
+ *  board, same pins, same calibration constants) and extended with the
+ *  production cloud layer. This is the thesis firmware, not a test
+ *  sketch.
  *
- * Key changes from v5.0.0:
- *   - WaterLevelSensor: removed entirely - this build has no physical
- *     water level sensor wired, and won't have one, so the class,
- *     its struct fields, and every reference to it have been taken
- *     out rather than kept as a permanently-disabled stub.
- *   - pH/Turbidity/Ammonia: now validate their actual voltage range
- *     (a floating/disconnected analog pin reads near 0V or near the
- *     3.3V rail, not a plausible mid-range value) before being
- *     considered valid.
- *   - Ammonia (MQ-137) warm-up is now NON-BLOCKING - it used to
- *     freeze the entire boot sequence for 60 seconds before the
- *     device even became reachable. It now warms up in the
- *     background while everything else operates normally, and is
- *     reported as "not connected" until warm-up genuinely completes.
- *   - Real fan state (active + duty%) is now sent to the backend,
- *     not inferred by the app from ambient temperature.
- *   - LCD startup sequence rewritten to the exact 4-message flow
- *     requested: "Starting the system...", "Waiting for
- *     connection...", "Connecting...", "Connected".
- *   - The WiFi connection wait no longer fully blocks fan/local
- *     sensor updates - it now services them periodically during
- *     the connection attempt instead of a tight blocking loop.
+ *  ARCHITECTURE (this build):
  *
- * NOTE: Relay module has been physically removed from this build -
- * filter/lights/flush commands are accepted but log a
- * "no hardware" warning instead of controlling anything.
+ *      ESP32  ->  WiFi router  ->  Supabase (Postgres + PostgREST)
+ *                              ->  Mobile app
  *
- * v7.1.0 changes (WebSocket reverted, auto-connect/retry kept):
- *   - AUTO-CONNECT: if the device is already paired, it now joins
- *     WiFi automatically at boot instead of waiting for the app to
- *     send /connect. The /connect endpoint still exists (harmless -
- *     useful for a manual retry without power-cycling), but is no
- *     longer required for normal operation.
- *   - AUTO-RETRY: if a connection attempt fails and the device falls
- *     back to IDLE, it now automatically retries every 30 seconds on
- *     its own, indefinitely, with no app interaction needed.
- *   - Sensor data goes back to plain HTTP POST (SensorApi) - the
- *     WebSocket real-time layer was reverted. Polling-based, proven,
- *     simple - matches the current backend (no Channels/daphne
- *     required, plain `runserver` works again).
+ *  No server code to deploy. The ESP32 inserts/reads rows directly over
+ *  Supabase's auto REST API (PostgREST), sending the project's anon key
+ *  in the `apikey` + `Authorization: Bearer` headers. Row Level Security
+ *  policies (created once in the SQL editor) bound what the anon key can
+ *  do. The mobile app reads the same tables (with Realtime) and writes
+ *  feeding schedules / commands.
  *
- * Libraries needed (Arduino IDE Library Manager):
- *   ArduinoJson (6.x), ESP32Servo, LiquidCrystal_I2C, OneWire,
- *   DallasTemperature
- * (WebServer and Preferences ship built-in with the ESP32 core.)
+ *  ---------------------------------------------------------------
+ *  PARITY WITH THE BENCH SKETCH (crx_pulse_test.ino)
+ *  ---------------------------------------------------------------
+ *  Every sensor formula and calibration constant below is byte-for-byte
+ *  the bench sketch's. Where this firmware HAD drifted from the bench
+ *  logic, it has been brought back in line:
+ *
+ *   1. LAST-GOOD SENSOR VALUES. The bench sketch only ever overwrites
+ *      airTemperature / humidity when the DHT11 read succeeds, so a
+ *      single failed read (very common on a DHT11) is invisible — it
+ *      keeps showing the last good value. This firmware now does the
+ *      same via a GRACE WINDOW: a sensor stays "valid" for
+ *      SENSOR_GRACE_MS after its last good read. Before, one dropped
+ *      read flipped ambient_valid=false, which blanked Housing
+ *      Temperature in the app AND cut the cooling fan mid-ramp.
+ *
+ *   2. COOLING FAN. Same ramp as the bench sketch (OFF < 25 C,
+ *      191->255 across 25-40 C, full above 40 C), now driven by the
+ *      last-good housing temperature instead of dropping to OFF on a
+ *      single dropped DHT11 read.
+ *
+ *   3. AMMONIA ESTIMATE. The bench sketch interpolates ONLY inside the
+ *      Sera reference band (V0..V2) and refuses to report outside it.
+ *      This firmware previously extrapolated up to 5.00 mg/L, i.e. it
+ *      invented numbers far beyond anything that was ever calibrated.
+ *      It now interpolates exactly as the bench sketch does and CLAMPS
+ *      to the calibrated span [0.00 .. 0.53] mg/L, flagging anything
+ *      outside the band as an estimate ("[est]") rather than inventing
+ *      a value.
+ *
+ *   4. SERIAL BENCH KEYS. The bench sketch's own printed guide and its
+ *      if-chain disagreed ('10' / '11' can never match a single char).
+ *      The guide's intent is implemented here: 7/8/9/a/b/c = 5..30 g,
+ *      and 2..6 = the bench sketch's manual Motor-1 PWM levels.
+ *
+ *   5. LCD. The bench sketch's motor page showed BOTH motors; the
+ *      production page had dropped the rotator. It is back.
+ *
+ *  ---------------------------------------------------------------
+ *  REST CONTRACT (Supabase PostgREST — tables, not functions)
+ *  ---------------------------------------------------------------
+ *  Headers on every call:  apikey: <anon key> , Authorization: Bearer <anon key>
+ *
+ *  1) POST  /rest/v1/readings
+ *       body (JSON, snake_case columns): {
+ *         device_id, ph, ammonia, turbidity, turbidity_status,
+ *         water_temp_c, ambient_temp_c, fan_active, fan_percent,
+ *         ph_valid, turbidity_valid, water_temp_valid,
+ *         ambient_valid, ammonia_valid
+ *       }
+ *       -> row inserted; recorded_at defaults to now().
+ *       ambient_temp_c is the DHT11 (the app's "Housing Temperature").
+ *
+ *  2) GET   /rest/v1/commands?device_id=eq.<id>&handled=eq.false
+ *            &select=id,type,grams,value,rotator_pwm,created_at
+ *            &order=created_at.asc&limit=1
+ *       -> [ { id, type, grams, value, rotator_pwm, created_at } ]
+ *          (bare array, oldest first)
+ *         - "feed_now"    { grams: 5|10|15|20|25|30, rotator_pwm }
+ *         - "servo_open"  / "servo_close"   (Test Components)
+ *         - "motor_test"  { value: rotator PWM 0..255, 0 stops }
+ *         - "log_stream"  { value: seconds of verbose serial mirroring }
+ *       One command per poll, oldest first, so a backlog drains one
+ *       feed at a time instead of dumping every queued feed at once.
+ *
+ *  3) PATCH /rest/v1/commands?id=eq.<id>   body { "handled": true }
+ *       -> marks that command handled so it is not run twice.
+ *
+ *  4) GET   /rest/v1/schedules?device_id=eq.<id>&active=eq.true
+ *       -> [ { id, time:"HH:MM", grams, rotator_pwm, active } ]
+ *       The ESP32 fires each active schedule once when the local clock
+ *       (NTP, UTC+8) reaches its HH:MM.
+ *
+ *  5) POST  /rest/v1/device_logs    (JSON ARRAY — one batch per flush)
+ *       body [ { device_id, message }, ... ]
+ *       -> every line this firmware prints, mirrored so the app's Test
+ *          Components console can show the same text a serial monitor
+ *          does. The phone has no serial link to the board; this table
+ *          IS the link. Event lines always; the sensor block only while
+ *          a "log_stream" command is in force.
+ *
+ *  FEEDING (servo) + DELAY-ROTATION (DC rotator motor):
+ *     On every feed (manual command OR schedule):
+ *       1. Servo opens to SERVO_OPEN_ANGLE (160 deg).
+ *       2. Held open for the gram-calibrated time (5g=400ms ... 30g=2400ms).
+ *       3. Servo returns to SERVO_CLOSED_ANGLE (180 deg).
+ *       4. Wait FEED_SETTLE_MS (1.5 s) for the feed to drop.
+ *       5. Run the DC rotator (Motor 1) for ROTATOR_RUN_MS (12 s) at the
+ *          speed the command/schedule asked for, then stop. The app
+ *          offers the five PWM levels the bench sketch tested
+ *          (0/90/128/191/255); 0 skips the rotation entirely.
+ *
+ *  TEST COMPONENTS (app Settings tab):
+ *     servo_open / servo_close / motor_test drive the actuators
+ *     directly. Both are bounded by the firmware, not by the app:
+ *     a test-opened door force-closes after SERVO_TEST_MAX_OPEN_MS
+ *     (10 s) and a test-driven motor stops after MOTOR_TEST_MAX_MS
+ *     (30 s). An open feeder door keeps dropping feed, and neither
+ *     actuator should keep running because somebody closed the app.
+ *
+ *  Libraries (Arduino IDE Library Manager):
+ *     WiFi, WiFiClientSecure, HTTPClient  (ESP32 core, built in)
+ *     ArduinoJson (Benoit Blanchon, v6.x)
+ *     DHT sensor library (Adafruit) + Adafruit Unified Sensor
+ *     OneWire, DallasTemperature
+ *     LiquidCrystal_I2C
+ *     ESP32Servo
+ * =====================================================================
  */
 
-// ===================================================================
-//  LIBRARY INCLUDES
-// ===================================================================
-#include <Arduino.h>
 #include <WiFi.h>
-#include <WebServer.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <ArduinoJson.h>
-#include <Wire.h>
-#include <LiquidCrystal_I2C.h>
+#include <time.h>
+#include <DHT.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <LiquidCrystal_I2C.h>
 #include <ESP32Servo.h>
-// WebSocketsClient_Generic removed - no longer needed. Per the
-// updated architecture, this device only ever makes outgoing HTTP
-// requests (WebServer for the local AP/discovery servers is
-// unrelated - that's the ESP32 acting as a server, not a client).
-#include <vector>
 
-// ===================================================================
-//  CONFIG
-// ===================================================================
 
-#define WIFI_RETRY_DELAY_MS 500
+// =====================================================
+// WIFI
+// =====================================================
 
-// FastAPI + MongoDB backend - much simpler than Firebase's per-function
-// URL scheme, since device_key resolves the account server-side on
-// every request (no project ID/region path segments needed at all).
+// SSID and password are no longer stored in this file.
 //
-// UPDATE THIS IP to match your PC's CURRENT LAN IP (run `ipconfig`
-// on Windows) - this WILL change if your router reassigns it, same
-// requirement as every backend this project has used so far.
-
-// ── STANDALONE MODE - no backend, no accounts ───────────────────
-// The device joins your WiFi router directly and PERMANENTLY at a
-// The ESP32 broadcasts its OWN WiFi network - your phone connects
-// directly to it, no router, no home network, no band-matching
-// concerns (2.4GHz vs 5GHz), no "are both devices on the same
-// network" question ever again. This is the entire network
-// configuration this firmware needs now.
+// The desktop WiFi Connector (desktop/) writes them into secrets.h,
+// which is gitignored — so credentials never enter the repository or
+// its history. To build by hand instead, copy secrets.h.example to
+// secrets.h and fill it in.
 //
-// The ESP32's own AP always gets IP 192.168.4.1 automatically - this
-// is fixed by the ESP32 WiFi library itself, not something you set.
-#define ESP32_AP_SSID     "CRX-Pulse-ESP32"
-#define ESP32_AP_PASSWORD "crxpulse123"   // minimum 8 characters, or "" for an open network
+// Nothing else about the WiFi logic changed: ssid/password are still
+// plain const char* used by startWiFi() and checkWiFi() exactly as
+// before.
+#include "secrets.h"
 
-// The Flutter app polls this port directly on the AP's IP above -
-// no backend, no login, fully local.
-#define LOCAL_SERVER_PORT 8080
+const char* ssid     = WIFI_SSID;
+const char* password = WIFI_PASSWORD;
 
-#define FIRMWARE_VERSION    "10.0.0"
+#define WIFI_LED_PIN 2
 
-#define PIN_PH              35
-#define PIN_TURBIDITY       34
-#define PIN_AMMONIA         39
-#define PIN_TEMP_SENSOR      4
+bool lastWiFiState = false;
 
-#define PIN_LCD_SDA         21
-#define PIN_LCD_SCL         22
-#define LCD_I2C_ADDR        0x27
+unsigned long lastWiFiAttempt = 0;
+const unsigned long WIFI_RETRY_INTERVAL = 10000;
 
-#define PIN_LED_RED         17
-#define PIN_LED_YELLOW       5
-#define PIN_LED_GREEN       23
-#define PIN_PIEZZO          16
 
-#define PIN_SERVO           33
-
-#define PIN_L298N_IN1       26
-#define PIN_L298N_IN2       27
-#define PIN_L298N_ENA       25
-
-#define PIN_FAN_ENB         32
-
-#define INTERVAL_SENSOR_MS    5000   // how often readings are refreshed and logged locally
-#define INTERVAL_COMMAND_MS   5000
-// AUTO_RECONNECT_RETRY_MS removed - per explicit request, the device
-// no longer auto-retries connecting while idle. See the manual-only
-// connect flow in setup()/loop() instead.
-#define INTERVAL_FEEDING_MS  30000
-#define SENSOR_SAMPLE_COUNT     20
-#define AMMONIA_WARMUP_MS    60000
-#define FAN_UPDATE_MS         2000
-#define HEALTH_CHECK_MS       3000
-#define LOCAL_LOOP_MS         3000
-
-// Analog sensor validity bounds - a floating/disconnected pin reads
-// near the rails (0V or 3.3V), not a plausible mid-range voltage.
-#define SENSOR_MIN_VALID_VOLTAGE  0.05f
-#define SENSOR_MAX_VALID_VOLTAGE  3.25f
-
-#define PH_VOLTAGE_AT_7     1.50f
-#define PH_VOLTS_PER_UNIT   0.18f
-#define TURBIDITY_V_CLEAR   2.50f
-#define AMMONIA_RO          10.0f
-#define AMMONIA_RL          10.0f
-#define AMMONIA_CLEAN_RATIO  3.6f
-
-#define SERVO_HOME_POS       90
-#define SERVO_OPEN_POS      180
-#define SERVO_MIN_PULSE     500
-#define SERVO_MAX_PULSE    2500
-#define FEED_MIN_GRAMS      10.0f
-#define FEED_MAX_GRAMS     500.0f
-#define FEED_MIN_MS         200
-#define FEED_MAX_MS        3000
-#define MIN_FEED_INTERVAL_MS 60000
-
-#define FAN_MIN_DUTY         51
-#define FAN_MAX_DUTY        255
-#define FAN_KICKSTART_DUTY  255
-#define FAN_KICKSTART_MS    400
-#define FAN_TEMP_LOW        28.0f
-#define FAN_TEMP_HIGH       40.0f
-#define FAN_PWM_FREQ       25000
-#define FAN_PWM_RES             8
-#define ENA_PWM_FREQ         5000
-#define ENA_PWM_RES              8
-
-#define PIEZO_PWM_FREQ       2000
-#define PIEZO_PWM_RES           8
-#define PIEZO_VOLUME_DUTY      60
-
-#define NTP_SERVER_1       "pool.ntp.org"
-#define NTP_SERVER_2       "time.nist.gov"
-#define NTP_UTC_OFFSET     28800
-#define NTP_DST_OFFSET     0
-
-// ===================================================================
-//  SENSORS
-// ===================================================================
-
-class ISensor
-{
-    public:
-        virtual ~ISensor() = default;
-        virtual bool begin() = 0;
-        virtual float read() = 0;
-        virtual const char* getName() const = 0;
-        virtual const char* getUnit() const = 0;
-        virtual bool isHealthy() const = 0;
-        virtual bool isValid() const = 0;
-        virtual float getLastReading() const = 0;
-};
-
-class SensorBase : public ISensor
-{
-    protected:
-        uint8_t _pin;
-        uint8_t _sampleCount;
-        float _lastReading;
-        float _lastVoltage;
-        bool _initialized;
-        bool _lastValid;
-
-        float _averageVoltage()
-        {
-            long total = 0;
-            for (uint8_t i = 0; i < _sampleCount; i++)
-            {
-                total += analogRead(_pin);
-                delay(5);
-            }
-            _lastVoltage = (total / (float)_sampleCount) * (3.3f / 4095.0f);
-
-            // A floating or disconnected analog pin reads pinned near
-            // 0V or near the 3.3V rail - never a plausible mid-range
-            // voltage a real sensor would produce. This is the actual
-            // validity check requested: don't trust a reading just
-            // because a number came back from analogRead().
-            _lastValid = (_lastVoltage > SENSOR_MIN_VALID_VOLTAGE &&
-                          _lastVoltage < SENSOR_MAX_VALID_VOLTAGE);
-
-            return _lastVoltage;
-        };
-
-    public:
-        explicit SensorBase(uint8_t pin, uint8_t sampleCount = SENSOR_SAMPLE_COUNT)
-        : _pin(pin), _sampleCount(sampleCount), _lastReading(0.0f), _lastVoltage(0.0f),
-          _initialized(false), _lastValid(false)
-        {
-        }
-
-        bool begin() override
-        {
-            pinMode(_pin, INPUT);
-            _initialized = true;
-            return true;
-        }
-
-        bool isHealthy() const override
-        {
-            return _initialized;
-        }
-
-        bool isValid() const override
-        {
-            return _initialized && _lastValid;
-        }
-
-        float getLastReading() const override
-        {
-            return _lastReading;
-        }
-};
-
-class PHSensor : public SensorBase
-{
-    private:
-        float _voltageAtPH7;
-        float _voltagePerUnit;
-        float _waterTempC;
-
-    public:
-        explicit PHSensor(
-            uint8_t pin = PIN_PH,
-            float voltageAtPH7 = PH_VOLTAGE_AT_7,
-            float voltagePerUnit = PH_VOLTS_PER_UNIT
-        )
-            : SensorBase(pin),
-             _voltageAtPH7(voltageAtPH7),
-             _voltagePerUnit(voltagePerUnit),
-             _waterTempC(25.0f)  // standard reference temp probes are calibrated at
-        {
-        }
-
-        /** Call before read() whenever a fresh water temperature is
-         *  available - ACCURACY FIX: a glass-electrode pH probe's
-         *  millivolt-per-pH slope follows the Nernst equation, which
-         *  is directly proportional to ABSOLUTE temperature. A probe
-         *  calibrated at 25 degC reads measurably wrong in water at,
-         *  say, 30 degC without this correction - the error grows
-         *  the further the reading is from pH 7 and the further the
-         *  water temperature is from the 25 degC calibration point.
-         *  Falls back to the 25 degC assumption (no correction) if
-         *  this is never called or the temperature is invalid, which
-         *  matches the ORIGINAL uncompensated behavior exactly - this
-         *  can only make readings more accurate, never less. */
-        void setWaterTempC(float tempC)
-        {
-            if (tempC > -20.0f && tempC < 60.0f)  // sanity bounds, not the sensor's own valid range
-            {
-                _waterTempC = tempC;
-            }
-        }
-
-        float read() override
-        {
-            float voltage = _averageVoltage();
-
-            // Nernst temperature compensation: slope scales linearly
-            // with absolute temperature relative to the 25 degC
-            // calibration reference.
-            const float kelvinAtCalibration = 25.0f + 273.15f;
-            float kelvinNow = _waterTempC + 273.15f;
-            float compensatedSlope = _voltagePerUnit * (kelvinNow / kelvinAtCalibration);
-
-            float ph = 7.0f + ((_voltageAtPH7 - voltage) / compensatedSlope);
-
-            _lastReading = constrain(ph, 0.0f, 14.0f);
-            return _lastReading;
-        }
-
-        void calibrate(float voltageAtPH7, float voltsPerUnit)
-        {
-            _voltageAtPH7 = voltageAtPH7;
-            _voltagePerUnit = voltsPerUnit;
-            Serial.println(F("[ph] Calibration updated."));
-        }
-
-        const char* getName() const override { return "pH Sensor V1.1"; }
-        const char* getUnit() const override { return "pH"; }
-
-        bool isSafeForCrayfish() const
-        {
-            return isValid() && _lastReading >= 7.0f && _lastReading <= 8.5f;
-        }
-};
-
-class TurbiditySensor : public SensorBase
-{
-    private:
-        float _voltageClear;
-
-    public:
-        explicit TurbiditySensor(
-            uint8_t pin = PIN_TURBIDITY,
-            float voltageClear = TURBIDITY_V_CLEAR
-        )
-            : SensorBase(pin)
-            , _voltageClear(voltageClear)
-        {
-        }
-
-        float read() override
-        {
-            float voltage = _averageVoltage();
-            float ntu = _voltageToNTU(voltage);
-            _lastReading = constrain(ntu, 0.0f, 3000.0f);
-            return _lastReading;
-        }
-
-        void calibrateClear(float voltageInCleanWater)
-        {
-            _voltageClear = voltageInCleanWater;
-            Serial.print(F("[Turbidity] Baseline set to"));
-            Serial.print(_voltageClear, 3);
-            Serial.println(F("V"));
-        }
-
-        const char* getName() const override { return "Turbidity Sensor V1.0"; }
-        const char* getUnit() const override { return "NTU"; }
-
-        bool isSafeForCrayfish() const
-        {
-            return isValid() && _lastReading < 50.0f;
-        }
-
-    private:
-        float _voltageToNTU(float voltage) const
-        {
-            if (voltage >= _voltageClear)
-            {
-                return 0.0f;
-            }
-
-            if (voltage < 1.5f)
-            {
-                return 3000.0f;
-            }
-
-            float ratio = (_voltageClear - voltage) / (_voltageClear - 1.5f);
-            return ratio * 3000.0f;
-        }
-};
-
-class AmmoniaSensor : public SensorBase
-{
-    private:
-        float _ro;
-        float _rl;
-        float _cleanAirRatio;
-        bool  _calibrated;
-        uint32_t _warmupStartMs;
-        bool  _warmupStarted;
-        bool  _warmedUp;
-        float _ambientTempC;
-
-    public:
-        explicit AmmoniaSensor(
-            uint8_t pin = PIN_AMMONIA,
-            float ro = AMMONIA_RO,
-            float rl = AMMONIA_RL,
-            float cleanAirRatio = AMMONIA_CLEAN_RATIO
-        )
-            : SensorBase(pin)
-            , _ro(ro)
-            , _rl(rl)
-            , _cleanAirRatio(cleanAirRatio)
-            , _calibrated(false)
-            , _warmupStartMs(0)
-            , _warmupStarted(false)
-            , _warmedUp(false)
-            , _ambientTempC(20.0f)  // MQ-series datasheets reference 20 degC
-        {
-        }
-
-        /** Call before read() whenever a fresh ambient/housing
-         *  temperature is available - ACCURACY FIX: MQ-series gas
-         *  sensors (MQ-137 included) have an Rs/Ro ratio that shifts
-         *  with temperature per the manufacturer's published
-         *  correction curve, since the sensing element's conductivity
-         *  is itself temperature-dependent. This applies a
-         *  conservative linear approximation of that correction
-         *  (roughly -2%/degC relative to the 20 degC reference, a
-         *  commonly used approximation when the full datasheet curve
-         *  isn't available in closed form) - meaningfully better than
-         *  no compensation at all, though a full calibration against
-         *  the exact datasheet curve would be more precise still.
-         *  Falls back to the 20 degC assumption if never called. */
-        void setAmbientTempC(float tempC)
-        {
-            if (tempC > -20.0f && tempC < 60.0f)
-            {
-                _ambientTempC = tempC;
-            }
-        }
-
-        float read() override
-        {
-            float voltage = _averageVoltage();
-
-            if (!_lastValid || voltage <= 0.01f)
-            {
-                _lastReading = 0.0f;
-                return 0.0f;
-            }
-
-            float rs = _voltageToResistance(voltage);
-
-            // Conservative linear temperature correction (~-2%/degC
-            // from the 20 degC reference) applied to Rs before the
-            // ratio is computed - see setAmbientTempC() above.
-            float tempDelta = _ambientTempC - 20.0f;
-            float correctionFactor = 1.0f - (0.02f * tempDelta);
-            correctionFactor = constrain(correctionFactor, 0.5f, 1.5f);  // never let a wild reading apply an absurd correction
-            rs *= correctionFactor;
-
-            float ppm = _resistanceToPPM(rs);
-
-            _lastReading = constrain(ppm, 0.0f, 1000.0f);
-            return _lastReading;
-        }
-
-        /** Call once, right after begin() - starts the non-blocking
-         *  warm-up timer without freezing the rest of the system. */
-        void beginWarmup()
-        {
-            _warmupStartMs = millis();
-            _warmupStarted = true;
-            Serial.println(F("[NH3] Warm-up started (non-blocking, running in background)"));
-        }
-
-        /** Call every loop() iteration - checks elapsed time and
-         *  performs the one-time calibration once warm-up completes.
-         *  Does NOT block anything while waiting. */
-        void updateWarmup(uint32_t warmupMs = AMMONIA_WARMUP_MS)
-        {
-            if (!_warmupStarted || _warmedUp) return;
-
-            if (millis() - _warmupStartMs >= warmupMs)
-            {
-                calibrateInCleanAir();
-                _warmedUp = true;
-                Serial.println(F("[NH3] Warm-up complete - sensor now reporting."));
-            }
-        }
-
-        void calibrateInCleanAir()
-        {
-            Serial.println(F("[NH3] Calibrating in clean air..."));
-
-            float voltage = _averageVoltage();
-            float rs = _voltageToResistance(voltage);
-            _ro = rs / _cleanAirRatio;
-            _calibrated = true;
-
-            Serial.print(F("[NH3] Ro = "));
-            Serial.print(_ro, 2);
-            Serial.println(F(" k(Ohms)"));
-        }
-
-        bool isCalibrated() const { return _calibrated; }
-        bool isWarmedUp() const { return _warmedUp; }
-
-        // Ammonia is only genuinely "valid" once BOTH the voltage is
-        // in a plausible range AND the warm-up/calibration has
-        // actually completed - reporting a reading before warm-up
-        // finishes would be exactly the kind of misleading data this
-        // update is meant to eliminate.
-        bool isValid() const override
-        {
-            return SensorBase::isValid() && _warmedUp && _calibrated;
-        }
-
-        const char* getName() const override { return "MQ-137 Ammonia"; }
-        const char* getUnit() const override { return "ppm"; }
-
-        bool isSafeForCrayfish() const
-        {
-            return isValid() && _lastReading < 0.5f;
-        }
-
-    private:
-        float _voltageToResistance(float voltage) const
-        {
-            return _rl * (3.3f - voltage) / voltage;
-        }
-
-        float _resistanceToPPM(float rs) const
-        {
-            float ratio = rs / _ro;
-            return 116.6020682f * powf(ratio, -2.769034857f);
-        }
-};
-
-class DS18B20Sensor {
-private:
-    OneWire _oneWire;
-    DallasTemperature _sensors;
-    int _deviceCount;
-    DeviceAddress _waterAddr;
-    DeviceAddress _ambientAddr;
-    bool _waterAddrValid;
-    bool _ambientAddrValid;
-
-public:
-    DS18B20Sensor()
-        : _oneWire(PIN_TEMP_SENSOR)
-        , _sensors(&_oneWire)
-        , _deviceCount(0)
-        , _waterAddrValid(false)
-        , _ambientAddrValid(false)
-    {}
-
-    bool begin() {
-        _sensors.begin();
-        _deviceCount = _sensors.getDeviceCount();
-
-        Serial.print(F("[DS18B20] Devices found: "));
-        Serial.println(_deviceCount);
-
-        if (_deviceCount < 2) {
-            Serial.println(F("[DS18B20] Expected 2 probes (water + ambient), found fewer - ambient/housing temp will report as Not Connected"));
-        }
-
-        // ACCURACY FIX: capture each probe's unique 64-bit ROM address
-        // ONCE at boot, and use THAT for every subsequent read instead
-        // of getTempCByIndex(). Reading by bus index is fragile - the
-        // DallasTemperature library enumerates devices in whatever
-        // order it discovers them on the OneWire bus, which is not
-        // contractually guaranteed to stay in the same order across
-        // power cycles or after any bus disturbance. Reading by the
-        // address captured here guarantees "water" and "ambient"
-        // always refer to the same physical probe for the rest of
-        // this power-up session, regardless of enumeration order.
-        if (_deviceCount >= 1) {
-            _waterAddrValid = _sensors.getAddress(_waterAddr, 0);
-            if (!_waterAddrValid) {
-                Serial.println(F("[DS18B20] getAddress(0) failed despite device being counted - falling back to index-based read for water temp"));
-            }
-        }
-        if (_deviceCount >= 2) {
-            _ambientAddrValid = _sensors.getAddress(_ambientAddr, 1);
-            if (!_ambientAddrValid) {
-                Serial.println(F("[DS18B20] getAddress(1) failed despite device being counted - falling back to index-based read for ambient temp"));
-            }
-        }
-
-        // ACCURACY FIX: explicit 12-bit resolution (0.0625 degC steps,
-        // the DS18B20's maximum) - the library's default depends on
-        // the specific clone/batch and isn't guaranteed to already be
-        // 12-bit. Conversion takes longer at 12-bit (~750ms) but
-        // requestTemperatures() already blocks until ready by default,
-        // so callers don't need to change anything to benefit.
-        if (_waterAddrValid) _sensors.setResolution(_waterAddr, 12);
-        if (_ambientAddrValid) _sensors.setResolution(_ambientAddr, 12);
-
-        return _deviceCount >= 1;
-    }
-
-    int getDeviceCount() const { return _deviceCount; }
-
-    void requestAll() {
-        _sensors.requestTemperatures();
-    }
-
-    float readWaterTempC() {
-        // FIX: fall back to index-based read if address capture
-        // failed at boot, rather than permanently reporting "Not
-        // Connected" for a probe that IS actually present and was
-        // counted - a failed getAddress() call should degrade
-        // gracefully, not lose the reading outright.
-        if (_waterAddrValid) return _sensors.getTempC(_waterAddr);
-        if (_deviceCount >= 1) return _sensors.getTempCByIndex(0);
-        return DEVICE_DISCONNECTED_C;
-    }
-
-    float readAmbientTempC() {
-        if (_ambientAddrValid) return _sensors.getTempC(_ambientAddr);
-        if (_deviceCount >= 2) return _sensors.getTempCByIndex(1);
-        return DEVICE_DISCONNECTED_C;
-    }
-
-    bool isValid(float tempC) const {
-        return tempC != DEVICE_DISCONNECTED_C && tempC > -55.0f && tempC < 125.0f;
-    }
-
-    const char* getName() const { return "DS18B20 Dual Probe"; }
-};
-
-/** Aggregated readings - every *Valid flag reflects the ACTUAL,
- *  independently-checked state of that specific component. */
-struct SensorReadings {
-    float ph;
-    float ammonia;
-    float turbidity;
-    float water_temp_c;
-    float ambient_temp_c;
-
-    bool  phValid;
-    bool  ammoniaValid;
-    bool  turbidityValid;
-    bool  waterTempValid;
-    bool  ambientTempValid;
-
-    bool  fanActive;
-    int   fanDutyPercent;
-};
-
-class SensorManager {
-private:
-    PHSensor          _phSensor;
-    TurbiditySensor   _turbiditySensor;
-    AmmoniaSensor     _ammoniaSensor;
-    DS18B20Sensor     _tempSensor;
-
-    std::vector<ISensor*> _sensors;
-
-public:
-    SensorManager()
-        : _phSensor()
-        , _turbiditySensor()
-        , _ammoniaSensor()
-        , _tempSensor()
-    {
-        _sensors = {
-            &_phSensor,
-            &_turbiditySensor,
-            &_ammoniaSensor,
-        };
-    }
-
-    bool begin() {
-        bool allOk = true;
-        for (ISensor* sensor : _sensors) {
-            bool ok = sensor->begin();
-            Serial.print(F("[SensorManager] "));
-            Serial.print(sensor->getName());
-            Serial.println(ok ? F(" Ready") : F(" Failed"));
-            if (!ok) allOk = false;
-        }
-
-        bool tempOk = _tempSensor.begin();
-        Serial.print(F("[SensorManager] "));
-        Serial.print(_tempSensor.getName());
-        Serial.println(tempOk ? F(" Ready") : F(" Failed"));
-        if (!tempOk) allOk = false;
-
-        return allOk;
-    }
-
-    /** Non-blocking - just starts the ammonia warm-up timer. */
-    void beginAmmoniaWarmup() {
-        _ammoniaSensor.beginWarmup();
-    }
-
-    /** Call every loop() iteration - completes ammonia warm-up in
-     *  the background without freezing anything else. */
-    void updateAmmoniaWarmup() {
-        _ammoniaSensor.updateWarmup(AMMONIA_WARMUP_MS);
-    }
-
-    bool isAmmoniaReady() const {
-        return _ammoniaSensor.isWarmedUp();
-    }
-
-    SensorReadings readAll(bool fanActive = false, int fanDutyPercent = 0) {
-        SensorReadings readings;
-
-        // ACCURACY FIX: temperatures are read FIRST now, and fed into
-        // the pH and ammonia sensors' temperature compensation BEFORE
-        // their own read() is called - both corrections need this
-        // session's actual temperature, not whatever was left over
-        // from the previous loop() iteration (or the 25/20 degC
-        // defaults, on the very first read before any temp is known).
-        _tempSensor.requestAll();
-        readings.water_temp_c   = _tempSensor.readWaterTempC();
-        readings.ambient_temp_c = _tempSensor.readAmbientTempC();
-        readings.waterTempValid   = _tempSensor.isValid(readings.water_temp_c);
-        readings.ambientTempValid = _tempSensor.isValid(readings.ambient_temp_c);
-
-        if (readings.waterTempValid)   _phSensor.setWaterTempC(readings.water_temp_c);
-        if (readings.ambientTempValid) _ammoniaSensor.setAmbientTempC(readings.ambient_temp_c);
-
-        readings.ph = _phSensor.read();
-        readings.phValid = _phSensor.isValid();
-
-        readings.turbidity = _turbiditySensor.read();
-        readings.turbidityValid = _turbiditySensor.isValid();
-
-        readings.ammonia = _ammoniaSensor.read();
-        readings.ammoniaValid = _ammoniaSensor.isValid();
-
-
-        readings.fanActive = fanActive;
-        readings.fanDutyPercent = fanDutyPercent;
-
-        return readings;
-    }
-
-    void printReadings(const SensorReadings& r) const {
-        Serial.println(F("---------------------------------------"));
-        Serial.println(F("         SENSOR READINGS               "));
-        Serial.println(F("---------------------------------------"));
-        _printRow("pH",          r.phValid,        r.ph,          "pH");
-        _printRow("Ammonia",     r.ammoniaValid,   r.ammonia,     "ppm");
-        _printRow("Turbidity",   r.turbidityValid, r.turbidity,   "NTU");
-        _printTempRow("Water Temp",   r.waterTempValid,   r.water_temp_c);
-        _printTempRow("Ambient Temp", r.ambientTempValid, r.ambient_temp_c);
-        Serial.print(F("  Fan: "));
-        Serial.print(r.fanActive ? F("ON") : F("OFF"));
-        Serial.print(F(" @ "));
-        Serial.print(r.fanDutyPercent);
-        Serial.println(F("%"));
-        Serial.println(F("---------------------------------------"));
-    }
-
-    PHSensor&         getPHSensor()         { return _phSensor;         }
-    TurbiditySensor&  getTurbiditySensor()  { return _turbiditySensor;  }
-    AmmoniaSensor&    getAmmoniaSensor()    { return _ammoniaSensor;    }
-    DS18B20Sensor&    getTempSensor()       { return _tempSensor;       }
-
-private:
-    void _printRow(const char* label, bool valid, float value, const char* unit) const {
-        Serial.print(F("  "));
-        Serial.print(label);
-        Serial.print(F(": "));
-        if (valid) {
-            Serial.print(value, 2);
-            Serial.print(F(" "));
-            Serial.println(unit);
-        } else {
-            Serial.println(F("NOT CONNECTED"));
-        }
-    }
-
-    void _printTempRow(const char* label, bool valid, float value) const {
-        Serial.print(F("  "));
-        Serial.print(label);
-        Serial.print(F(": "));
-        if (valid) {
-            Serial.print(value, 1);
-            Serial.println(F(" C"));
-        } else {
-            Serial.println(F("NOT CONNECTED"));
-        }
-    }
-};
-
-// ===================================================================
-//  ACTUATORS
-// ===================================================================
-
-class IActuator
-{
-    public:
-        virtual ~IActuator() = default;
-
-        virtual bool begin() = 0;
-        virtual void activate() = 0;
-        virtual void deactivate() = 0;
-        virtual bool isActive() const = 0;
-        virtual const char* getName() const = 0;
-};
-
-class ServoActuator : public IActuator {
-private:
-    Servo       _servo;
-    uint8_t     _pin;
-    const char* _zoneName;
-    bool        _active;
-    bool        _attached;
-
-public:
-    explicit ServoActuator(uint8_t pin, const char* zoneName)
-        : _pin(pin)
-        , _zoneName(zoneName)
-        , _active(false)
-        , _attached(false)
-    {}
-
-    bool begin() override {
-        _attached = _servo.attach(_pin, SERVO_MIN_PULSE, SERVO_MAX_PULSE);
-        _servo.write(SERVO_HOME_POS);
-        delay(300);
-        Serial.print(F("[Servo] "));
-        Serial.print(_zoneName);
-        Serial.println(_attached ? F(" -> HOME (attached)") : F(" -> FAILED TO ATTACH"));
-        return _attached;
-    }
-
-    void activate() override {
-        _servo.write(SERVO_OPEN_POS);
-        _active = true;
-    }
-
-    void deactivate() override {
-        _servo.write(SERVO_HOME_POS);
-        _active = false;
-    }
-
-    bool isActive() const override { return _active; }
-    bool isAttached() const { return _attached; }
-
-    const char* getName() const override { return _zoneName; }
-
-    void dispense(float amountGrams) {
-        if (!_attached) {
-            Serial.print(F("[Servo] "));
-            Serial.print(_zoneName);
-            Serial.println(F(" - cannot dispense, servo not attached"));
-            return;
-        }
-
-        uint32_t openTimeMs = _gramsToMs(amountGrams);
-
-        Serial.print(F("[Servo]  "));
-        Serial.print(_zoneName);
-        Serial.print(F(" -> dispensing "));
-        Serial.print(amountGrams, 1);
-        Serial.print(F("g ("));
-        Serial.print(openTimeMs);
-        Serial.println(F("ms)"));
-
-        activate();
-        delay(openTimeMs);
-        deactivate();
-
-        Serial.print(F("[Servo]  "));
-        Serial.print(_zoneName);
-        Serial.println(F(" done"));
-    }
-
-    void moveTo(int degrees) {
-        _servo.write(constrain(degrees, 0, 180));
-    }
-
-private:
-    uint32_t _gramsToMs(float grams) const {
-        float clamped = constrain(grams, FEED_MIN_GRAMS, FEED_MAX_GRAMS);
-        return (uint32_t)map(
-            (long)clamped,
-            (long)FEED_MIN_GRAMS,
-            (long)FEED_MAX_GRAMS,
-            FEED_MIN_MS,
-            FEED_MAX_MS
-        );
-    }
-};
-
-class FeedingMechanism {
-private:
-    ServoActuator _zone1;
-    unsigned long _lastFeedMs = 0;
-
-public:
-    FeedingMechanism()
-        : _zone1(PIN_SERVO, "Zone 1")
-    {}
-
-    bool begin() {
-        bool ok = _zone1.begin();
-        Serial.println(F("[FeedingMechanism] Feeder ready"));
-        return ok;
-    }
-
-    bool isServoAttached() const {
-        return _zone1.isAttached();
-    }
-
-    bool dispenseToZone(const String& zone, float amountGrams) {
-        if (zone != "zone_1") {
-            Serial.print(F("[FeedingMechanism] Unknown zone: "));
-            Serial.println(zone);
-            return false;
-        }
-        return feedNow(amountGrams);
-    }
-
-    bool feedNow(float amountGrams) {
-        unsigned long now = millis();
-        if (_lastFeedMs != 0 && (now - _lastFeedMs) < MIN_FEED_INTERVAL_MS) {
-            unsigned long remainingS = (MIN_FEED_INTERVAL_MS - (now - _lastFeedMs)) / 1000;
-            Serial.print(F("[FeedingMechanism] Feed blocked - cooldown active ("));
-            Serial.print(remainingS);
-            Serial.println(F("s remaining)"));
-            return false;
-        }
-
-        Serial.println(F("[FeedingMechanism] Feed triggered"));
-        _zone1.dispense(amountGrams);
-        _lastFeedMs = now;
-        return true;
-    }
-
-    ServoActuator& getZone1() { return _zone1; }
-};
-
-/** FanController now tracks and exposes its REAL state at all times -
- *  isActive() and getDutyPercent() reflect exactly what's being
- *  driven on the hardware, not an assumption. */
-class FanController : public IActuator {
-private:
-    int _currentDuty = 0;
-    uint32_t _lastUpdate = 0;
-    bool _active = false;
-    bool _initialized = false;
-
-public:
-    bool begin() override {
-        ledcAttach(PIN_FAN_ENB, FAN_PWM_FREQ, FAN_PWM_RES);
-
-        Serial.println(F("[FanController] Kick-starting..."));
-        ledcWrite(PIN_FAN_ENB, FAN_KICKSTART_DUTY);
-        delay(FAN_KICKSTART_MS);
-        ledcWrite(PIN_FAN_ENB, FAN_MIN_DUTY);
-        _currentDuty = FAN_MIN_DUTY;
-        _active = true;
-        _initialized = true;
-        Serial.println(F("[FanController] Settled to 20% baseline speed"));
-        return true;
-    }
-
-    void activate() override { }
-    void deactivate() override { ledcWrite(PIN_FAN_ENB, 0); _currentDuty = 0; _active = false; }
-
-    // Real state - true only if begin() succeeded AND duty is above 0.
-    bool isActive() const override { return _initialized && _active && _currentDuty > 0; }
-
-    const char* getName() const override { return "Cooling Fan"; }
-
-    void update(float ambientTempC, bool ambientValid) {
-        uint32_t now = millis();
-        if (now - _lastUpdate < FAN_UPDATE_MS) return;
-        _lastUpdate = now;
-
-        // Without a valid ambient reading, fall back to the safe
-        // baseline speed rather than guessing - this is itself an
-        // honest, documented behavior (never silently assume "hot").
-        if (!ambientValid) {
-            if (_currentDuty != FAN_MIN_DUTY) {
-                _currentDuty = FAN_MIN_DUTY;
-                ledcWrite(PIN_FAN_ENB, _currentDuty);
-            }
-            return;
-        }
-
-        int duty;
-        if (ambientTempC <= FAN_TEMP_LOW) {
-            duty = FAN_MIN_DUTY;
-        } else if (ambientTempC >= FAN_TEMP_HIGH) {
-            duty = FAN_MAX_DUTY;
-        } else {
-            float ratio = (ambientTempC - FAN_TEMP_LOW) / (FAN_TEMP_HIGH - FAN_TEMP_LOW);
-            duty = FAN_MIN_DUTY + static_cast<int>(ratio * (FAN_MAX_DUTY - FAN_MIN_DUTY));
-        }
-
-        if (_currentDuty == 0 && duty > 0) {
-            ledcWrite(PIN_FAN_ENB, FAN_KICKSTART_DUTY);
-            delay(FAN_KICKSTART_MS);
-        }
-
-        if (duty != _currentDuty) {
-            _currentDuty = duty;
-            ledcWrite(PIN_FAN_ENB, _currentDuty);
-        }
-    }
-
-    int getDutyPercent() const { return (_currentDuty * 100) / 255; }
-};
-
-// ===================================================================
-//  LOCAL API SERVER — fully offline, no backend, no accounts
-// ===================================================================
+// =====================================================
+// SUPABASE LAYER  (direct PostgREST — no server to deploy)
+// =====================================================
 //
-// Per the pivot away from the FastAPI backend: this ESP32 now runs
-// entirely standalone. It connects to WiFi using the hardcoded
-// credentials below and serves live sensor data + a feed trigger
-// directly to whichever app on the local network asks for it - no
-// login, no device_key, no pairing flow, no MongoDB history. The
-// Flutter app polls this directly.
-class LocalApiServer {
-private:
-    WebServer _server;
-    SensorManager& _sensorManager;
-    FeedingMechanism& _feedingMechanism;
-    FanController& _fanController;
-    SensorReadings* _latestReadings;
+// The ESP32 talks straight to Supabase's auto-generated REST API
+// (PostgREST). There are NO Cloud Functions to deploy — inserts and
+// reads go directly to database tables, gated by Row Level Security.
+//
+//   SUPABASE_URL : your project URL, e.g. "https://abcd1234.supabase.co"
+//                  (Supabase dashboard -> Project Settings -> API -> Project URL)
+//   SUPABASE_KEY : the project's "anon public" API key
+//                  (same page -> Project API keys -> anon public)
+//   DEVICE_ID    : this tank's id; must match the devices row the app
+//                  creates when you tap "Pair Device".
+//
+// The anon key is safe to embed (it is designed to be public and is
+// bounded by the RLS policies you create in the SQL editor).
 
-public:
-    LocalApiServer(SensorManager& sensorManager, FeedingMechanism& feedingMechanism, FanController& fanController, SensorReadings* latestReadings)
-        : _server(LOCAL_SERVER_PORT)
-        , _sensorManager(sensorManager)
-        , _feedingMechanism(feedingMechanism)
-        , _fanController(fanController)
-        , _latestReadings(latestReadings)
-    {}
+#define SUPABASE_URL  "https://qlrjplwxsgklawunuoey.supabase.co"
+#define SUPABASE_KEY  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFscmpwbHd4c2drbGF3dW51b2V5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTE3MDUxMTQsImV4cCI6MjEwNzI4MTExNH0.BWiTxwr6kafN5EuyyEIsQZ0Ikd7QelARsJSMkNyVxh8"
+#define DEVICE_ID     "tank_01"
 
-    void begin() {
-        _server.on("/status", HTTP_GET, [this]() { _handleStatus(); });
-        _server.on("/feed", HTTP_POST, [this]() { _handleFeed(); });
-        _server.begin();
-        Serial.print(F("[LocalApi] Server started on port "));
-        Serial.println(LOCAL_SERVER_PORT);
-    }
+#define FIRMWARE_VERSION  "13.0.0"
 
-    void handleClient() {
-        _server.handleClient();
-    }
+// How often the ESP32 pushes a reading to Supabase, and polls for
+// commands / schedules. These are the CLOUD cadences; the LCD and the
+// local serial print update on their own faster timers below.
+//
+// The app treats a reading as live for 3x CLOUD_READING_INTERVAL (see
+// _freshWindow in lib/core/firmware_spec.dart) — change one and change
+// the other.
+const unsigned long CLOUD_READING_INTERVAL  = 10000;  // push reading every 10 s
+const unsigned long CLOUD_COMMAND_INTERVAL  =  5000;  // poll commands every 5 s
+const unsigned long CLOUD_SCHEDULE_INTERVAL = 60000;  // refresh schedules every 60 s
 
-private:
-    void _addCors() {
-        _server.sendHeader("Access-Control-Allow-Origin", "*");
-    }
+unsigned long lastCloudReading  = 0;
+unsigned long lastCloudCommand  = 0;
+unsigned long lastCloudSchedule = 0;
 
-    /** Same honesty principle as the old backend: a disconnected/
-     *  invalid sensor is OMITTED from the JSON entirely, never sent
-     *  as a fake zero - the app shows "Not Connected" for anything
-     *  missing rather than a misleading number. */
-    void _handleStatus() {
-        _addCors();
-        DynamicJsonDocument doc(512);
-        const SensorReadings& r = *_latestReadings;
+// ---------------------------------------------------------------
+// SERIAL LOG MIRROR  (feeds the app's Test Components console)
+// ---------------------------------------------------------------
+//
+// Every line this firmware prints goes through logLine(), which writes
+// it to Serial exactly as before AND queues it for upload to the
+// `device_logs` table. The app subscribes to that table, so its console
+// shows the same text as a serial monitor.
+//
+// Two classes of line, because a console nobody is watching must not
+// fill the database:
+//
+//   EVENT lines (feeds, commands, schedules, WiFi changes, errors) are
+//   always mirrored. They are rare, and they are the ones worth having
+//   history for when you open the console later.
+//
+//   VERBOSE lines (the sensor block, printed every SENSOR_INTERVAL) are
+//   mirrored only while the app has asked for them with a `log_stream`
+//   command. The console sends that on open and renews it while it
+//   stays open, so verbose output stops by itself a few minutes after
+//   you navigate away.
 
-        if (r.phValid) doc["ph"] = serialized(String(r.ph, 2));
-        if (r.ammoniaValid) doc["ammonia"] = serialized(String(r.ammonia, 3));
-        if (r.turbidityValid) doc["turbidity"] = serialized(String(r.turbidity, 1));
-        if (r.waterTempValid) doc["water_temp_c"] = serialized(String(r.water_temp_c, 1));
-        if (r.ambientTempValid) doc["ambient_temp_c"] = serialized(String(r.ambient_temp_c, 1));
+#define MAX_LOG_LINES 24
+#define MAX_LOG_LEN   120
 
-        doc["fan_active"] = _fanController.isActive();
-        doc["fan_duty_percent"] = _fanController.getDutyPercent();
-        doc["mac_address"] = WiFi.macAddress();
-        doc["firmware_version"] = FIRMWARE_VERSION;
+char logBuf[MAX_LOG_LINES][MAX_LOG_LEN];
+int  logCount = 0;
+bool logOverflowed = false;      // lines dropped since the last flush
 
-        String out;
-        serializeJson(doc, out);
-        _server.send(200, "application/json", out);
-    }
+unsigned long lastLogFlush = 0;
+const unsigned long LOG_FLUSH_INTERVAL = 3000;   // batch-insert every 3 s
 
-    void _handleFeed() {
-        _addCors();
-        Serial.println(F("[LocalApi] Feed triggered via app"));
-        _feedingMechanism.feedNow(100.0f);
-        _server.send(200, "application/json", "{\"success\":true}");
-    }
+// Verbose mirroring is on until this millis() deadline (0 = off).
+unsigned long logStreamUntil = 0;
+const unsigned long LOG_STREAM_MAX_S = 900;      // cap one request at 15 min
+
+// A queued "Feed Now" older than this is dropped instead of dispensed.
+// Without it, every feed the user tapped while the tank was offline
+// would fire back-to-back the moment the ESP32 reconnects — which is
+// how a tank gets a day's worth of feed in one minute.
+const long FEED_COMMAND_MAX_AGE_S = 600;   // 10 minutes
+
+// NTP (Philippines, UTC+8, no DST)
+const long  NTP_GMT_OFFSET = 28800;
+const int   NTP_DST_OFFSET = 0;
+bool timeSynced = false;
+
+// Cached feeding schedules fetched from Supabase.
+#define MAX_SCHEDULES 12
+struct FeedSchedule {
+  char time[6];   // "HH:MM"
+  int  grams;
+  int  rotatorPwm;
+  bool active;
 };
 
+FeedSchedule schedules[MAX_SCHEDULES];
+int scheduleCount = 0;
+int lastFedMinuteOfDay = -1;   // prevents double-firing within the same minute
 
-// ===================================================================
-//  DISPLAY & STATUS
-// ===================================================================
+// getLocalTime() blocks while it waits for the clock, so the schedule
+// check runs once a second rather than on every loop pass.
+unsigned long lastScheduleCheck = 0;
+const unsigned long SCHEDULE_CHECK_INTERVAL = 1000;
 
-class LcdDashboard {
-private:
-    LiquidCrystal_I2C _lcd;
 
-public:
-    LcdDashboard() : _lcd(LCD_I2C_ADDR, 16, 2) {}
+// =====================================================
+// PIN DEFINITIONS  (identical to the calibrated bench sketch)
+// =====================================================
 
-    bool begin() {
-        Wire.begin(PIN_LCD_SDA, PIN_LCD_SCL);
-        // FIX: PCF8574-based I2C LCD backpacks (this one uses the
-        // common 0x27 address) need a short settle time after the
-        // I2C bus comes up and before init() - calling init()
-        // immediately is a well-known cause of garbled/corrupted
-        // characters on the FIRST screen shown after power-on,
-        // since the LCD controller itself hasn't finished its own
-        // internal power-on reset yet.
-        delay(50);
-        _lcd.init();
-        _lcd.backlight();
-        _lcd.clear();  // some clones retain garbage in DDRAM through init() alone
-        return isResponding();
-    }
+// DHT11  (HOUSING / AMBIENT temperature + humidity)
+#define DHT_PIN 16
+#define DHT_TYPE DHT11
 
-    bool isResponding() {
-        Wire.beginTransmission(LCD_I2C_ADDR);
-        return Wire.endTransmission() == 0;
-    }
+// DS18B20  (WATER temperature)
+#define WATER_TEMP_PIN 18
 
-    void showDashboard(int workingCount, int totalCount) {
-        _lcd.clear();
-        _lcd.setCursor(0, 0);
-        _lcd.print("CRX PULSE");
-        _lcd.setCursor(0, 1);
-        _lcd.print("COMPONENTS ");
-        _lcd.print(workingCount);
-        _lcd.print("/");
-        _lcd.print(totalCount);
-    }
+// Analog sensors (all ADC1 — safe with WiFi active)
+#define TURBIDITY_PIN 34
+#define PH_PIN 32
+#define AMMONIA_PIN 35
 
-    void showRaw(const char* line1, const char* line2) {
-        _lcd.clear();
-        _lcd.setCursor(0, 0);
-        _lcd.print(line1);
-        _lcd.setCursor(0, 1);
-        _lcd.print(line2);
-    }
-};
+// Feeder servo
+#define SERVO_PIN 19
 
-enum class WifiLedState : uint8_t { RED, YELLOW, GREEN };
+// I2C LCD
+#define I2C_SDA 21
+#define I2C_SCL 22
 
-class StatusIndicator {
-private:
-    WifiLedState _current = WifiLedState::YELLOW;
 
-public:
-    void begin() {
-        pinMode(PIN_LED_RED, OUTPUT);
-        pinMode(PIN_LED_YELLOW, OUTPUT);
-        pinMode(PIN_LED_GREEN, OUTPUT);
+// =====================================================
+// L298N MOTOR 1  ->  DC ROTATOR (runs after each feed)
+// =====================================================
 
-        ledcAttach(PIN_PIEZZO, PIEZO_PWM_FREQ, PIEZO_PWM_RES);
-        ledcWrite(PIN_PIEZZO, 0);
-    }
+#define MOTOR1_EN 25
+#define MOTOR1_IN1 26
+#define MOTOR1_IN2 27
 
-    void setState(WifiLedState state) {
-        if (state == _current) return;
-        digitalWrite(PIN_LED_RED,    state == WifiLedState::RED    ? HIGH : LOW);
-        digitalWrite(PIN_LED_YELLOW, state == WifiLedState::YELLOW ? HIGH : LOW);
-        digitalWrite(PIN_LED_GREEN,  state == WifiLedState::GREEN  ? HIGH : LOW);
-        _current = state;
-    }
 
-    /** Toggles the yellow LED on/off every ~400ms - call this every
-     *  loop() iteration while waiting for a phone to connect, instead
-     *  of setState() (which only supports a solid, unchanging color).
-     *  Turns off red/green so only yellow is ever lit while blinking. */
-    void blinkYellow(unsigned long now) {
-        static unsigned long lastToggle = 0;
-        static bool on = false;
-        if (now - lastToggle >= 400) {
-            lastToggle = now;
-            on = !on;
-            digitalWrite(PIN_LED_YELLOW, on ? HIGH : LOW);
-            digitalWrite(PIN_LED_RED, LOW);
-            digitalWrite(PIN_LED_GREEN, LOW);
-            _current = WifiLedState::YELLOW;  // keeps setState() honest about current color
+// =====================================================
+// L298N MOTOR 2  ->  COOLING FAN (automatic, DHT11-driven)
+// =====================================================
+
+#define MOTOR2_EN 33
+#define MOTOR2_IN1 17
+#define MOTOR2_IN2 23
+
+
+// =====================================================
+// OBJECTS
+// =====================================================
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+OneWire oneWire(WATER_TEMP_PIN);
+DallasTemperature waterTempSensor(&oneWire);
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+Servo myServo;
+
+
+// =====================================================
+// SERVO FEEDER CALIBRATION  (bench-sketch values)
+// =====================================================
+//
+// 180 = CLOSED / resting.   160 = OPEN (feeding).
+// Grams -> how long the door stays open:
+//
+//   Target grams | Delay (ms)
+//   -------------+-----------
+//        5       |    400
+//       10       |    800
+//       15       |   1200
+//       20       |   1600
+//       25       |   2000
+//       30       |   2400
+
+const int SERVO_OPEN_ANGLE   = 160;
+const int SERVO_CLOSED_ANGLE = 180;
+
+unsigned long gramsToOpenMs(int grams) {
+  switch (grams) {
+    case 5:  return 400;
+    case 10: return 800;
+    case 15: return 1200;
+    case 20: return 1600;
+    case 25: return 2000;
+    case 30: return 2400;
+    default: return 800;   // safe fallback ~10 g
+  }
+}
+
+// Delay-rotation of the DC rotator after feed is released.
+const unsigned long FEED_SETTLE_MS = 1500;   // wait 1.5 s after the door closes
+
+// How long the DC rotator spins after each feed. 2 s was not enough to
+// complete a turn; 10-15 s is. Anywhere in that range is fine.
+const unsigned long ROTATOR_RUN_MS = 12000;  // 12 s
+
+// NON-BLOCKING, and it has to be at this length. runRotator() used to
+// delay() for the whole spin, which was tolerable at 2 s. At 12 s it
+// would stall loop() — no WiFi service, no cloud push, no command
+// poll — for the entire spin. With CLOUD_READING_INTERVAL at 10 s that
+// pushes the gap between readings to ~29 s, and the app treats
+// anything over 30 s as a dead device (FirmwareSpec.freshWindow). The
+// feed would make the tank look like it had dropped offline.
+//
+// So the rotation is a deadline serviced from loop() instead.
+// rotatorStopAt == 0 means idle.
+unsigned long rotatorStopAt = 0;
+
+// doFeed() is blocking (it uses delay()), so a schedule cannot interrupt
+// a command feed. This flag is belt-and-braces for the same guarantee.
+bool feedInProgress = false;
+
+
+// =====================================================
+// TEST-COMPONENT SAFETY TIMERS
+// =====================================================
+//
+// The app's Test Components screen can drive the servo and the rotator
+// directly. Both are left running until told otherwise, which is fine
+// on a bench and not fine on a tank: an open feeder door keeps dropping
+// feed, and a motor left on runs until the power is pulled.
+//
+// So a test-driven actuator always has a deadline. These do nothing to
+// a normal feed, which drives both actuators itself and returns them to
+// rest before it finishes.
+
+const unsigned long SERVO_TEST_MAX_OPEN_MS = 10000;   // 10 s, then close
+const unsigned long MOTOR_TEST_MAX_MS      = 30000;   // 30 s, then stop
+
+unsigned long servoTestOpenedAt = 0;   // 0 = not opened by a test
+unsigned long motorTestStartedAt = 0;  // 0 = not started by a test
+
+
+// =====================================================
+// TURBIDITY CALIBRATION  (SEN0189, no divider)
+// =====================================================
+//
+// Relative turbidity % = (V_CLEAR - V) / (V_CLEAR - V_HIGH) * 100
+//
+// The four status bands below are voltage thresholds. Their PERCENT
+// equivalents (which is what the app receives) are:
+//
+//   Clear            :   0.0 % .. 19.9 %
+//   Slightly Turbid  :  19.9 % .. 48.5 %
+//   Turbid           :  48.5 % .. 78.6 %
+//   Highly Turbid    :  78.6 % .. 100.0 %
+//
+// The app derives those same numbers from these same constants in
+// lib/core/firmware_spec.dart — keep the two in step.
+
+const float V_CLEAR = 1.3646;   // 0.00% relative turbidity
+const float V_HIGH  = 1.1916;   // 100.00% relative turbidity
+
+const float TURBIDITY_T1 = 1.33015;  // Clear -> Slightly Turbid
+const float TURBIDITY_T2 = 1.28065;  // Slightly Turbid -> Turbid
+const float TURBIDITY_T3 = 1.22865;  // Turbid -> Highly Turbid
+
+
+// =====================================================
+// pH CALIBRATION  (3-point, carried over from the bench sketch)
+// =====================================================
+//
+// Replace with YOUR measured buffer voltages if you recalibrate.
+
+float voltage_pH7 = 1.950;   // reading at 6.86 buffer
+float voltage_pH4 = 2.447;   // reading at 4.01 buffer
+float voltage_pH9 = 1.425;   // reading at 9.18 buffer
+
+const float PH_DIVIDER_RATIO = 2.0;
+
+
+// =====================================================
+// MQ-137 AMMONIA
+// =====================================================
+//
+//   MQ-137 AO --[10k]--+--[10k]-- GND, GPIO35 reads the midpoint,
+//   so GPIO35 sees half the MQ-137 output voltage.
+//
+// Sera reference points measured on the bench. These are the ONLY
+// concentrations this sensor has ever been calibrated against, so the
+// estimate is clamped to the span they cover — see readSensors().
+
+const float AMMONIA_DIVIDER_RATIO = 2.0;
+
+const float AMMONIA_V0 = 0.2655;   // volts at 0.00 mg/L
+const float AMMONIA_V1 = 0.4030;   // volts at 0.17 mg/L
+const float AMMONIA_V2 = 0.4400;   // volts at 0.53 mg/L
+
+const float AMMONIA_C0 = 0.00;     // mg/L
+const float AMMONIA_C1 = 0.17;
+const float AMMONIA_C2 = 0.53;
+
+int   ammoniaADC = 0;
+float ammoniaADCVoltage = 0.0;
+float ammoniaSensorVoltage = 0.0;
+
+float ammoniaEstimatedMgL = 0.0;
+bool  ammoniaInCalibrationRange = false;
+
+// Turbidity raw values (globals so the printer / payload can read them).
+int   turbidityADC = 0;
+float turbidityADCVoltage = 0.0;
+
+
+// =====================================================
+// LIVE SENSOR VALUES + per-sensor validity
+// =====================================================
+//
+// GRACE WINDOW — matching the bench sketch's "keep the last good
+// value" behaviour. A DHT11 drops reads routinely; a DS18B20 can miss
+// a conversion. Flipping a sensor to invalid on the FIRST failure made
+// the app blink "Not Connected" and cut the fan mid-ramp. A sensor now
+// stays valid until it has been failing for this long.
+
+const unsigned long SENSOR_GRACE_MS = 15000;   // 15 s of silence = really gone
+
+float waterTemperature = 0.0;
+bool  waterTempValid   = false;
+unsigned long lastWaterTempOk = 0;
+bool  waterTempEverRead = false;
+
+float airTemperature = 0.0;   // = HOUSING / ambient temp (DHT11)
+float humidity       = 0.0;
+bool  ambientValid   = false;
+unsigned long lastAmbientOk = 0;
+bool  ambientEverRead = false;
+
+float  relativeTurbidity = 0.0;
+String turbidityStatus   = "--";
+bool   turbidityValid    = false;
+
+int   phADC = 0;          // raw count, 0..4095
+float phPinVoltage = 0.0;  // volts at the pin, before the 2:1 divider
+float phVoltage = 0.0;     // reconstructed probe output
+float pH = 7.0;
+bool  phValid = false;
+
+bool  ammoniaValid = false;
+
+int servoPosition = 0;
+
+int  motor1PWM = 0;        // DC rotator
+int  motor2PWM = 0;        // cooling fan
+bool fanActive = false;
+
+
+// =====================================================
+// LCD
+// =====================================================
+
+int lcdPage = 0;
+unsigned long lastLCDUpdate = 0;
+const unsigned long LCD_INTERVAL = 2500;
+
+
+// =====================================================
+// LOCAL SENSOR TIMING
+// =====================================================
+
+unsigned long lastSensorRead = 0;
+const unsigned long SENSOR_INTERVAL = 2000;
+
+
+// =====================================================
+// COOLING FAN (automatic, driven by DHT11 housing temp)
+// =====================================================
+//
+//  < 25 C : OFF
+//  25-40 C: ramp 191 -> 255
+//  > 40 C : full (255)
+//
+// Identical to the bench sketch. Mirrored in the app by
+// computeFanSpeed() in lib/core/fan_speed_util.dart.
+
+const float COOLING_START = 25.0;
+const float COOLING_MAX   = 40.0;
+const int   COOLING_MIN_PWM = 191;
+const int   COOLING_MAX_PWM = 255;
+
+
+// =====================================================
+// FORWARD DECLARATIONS
+// =====================================================
+
+bool   ackCommand(const String& id);
+long   commandAgeSeconds(const String& createdAt);
+void   doFeed(int grams, int rotatorPwm);
+void   startRotator(unsigned long ms, int pwm);
+void   serviceRotator();
+void   finishFeed();
+String getAmmoniaStatus(float mgL);
+void   logLine(const String& s, bool verbose = false);
+void   flushLogs();
+bool   logStreaming();
+
+
+// =====================================================
+// SERIAL LOG MIRROR
+// =====================================================
+
+bool logStreaming() {
+  return logStreamUntil != 0 && (long)(millis() - logStreamUntil) < 0;
+}
+
+/// Print a line to Serial and queue it for the app's console.
+///
+/// [verbose] marks the high-volume lines (the sensor block): they reach
+/// Serial always, but the cloud only while streaming is switched on.
+void logLine(const String& s, bool verbose) {
+  Serial.println(s);
+
+  if (verbose && !logStreaming()) return;
+
+  if (logCount >= MAX_LOG_LINES) {
+    // Keep the OLDEST lines and note the gap. Dropping the newest is
+    // the wrong way round for a log you are reading after the fact —
+    // but either way the console is told, rather than silently showing
+    // a log with holes in it.
+    logOverflowed = true;
+    return;
+  }
+
+  strncpy(logBuf[logCount], s.c_str(), MAX_LOG_LEN - 1);
+  logBuf[logCount][MAX_LOG_LEN - 1] = '\0';
+
+  // Truncating at a fixed byte count can cut a multi-byte UTF-8
+  // character in half, and several lines here contain an em-dash
+  // ("[est — outside calibrated band]"). A half character is invalid
+  // UTF-8, Postgres rejects the whole INSERT with "invalid byte
+  // sequence for encoding UTF8", and the ENTIRE batch of log lines is
+  // lost — silently, since flushLogs() cannot log its own failure.
+  //
+  // So drop a trailing sequence only when it is actually INCOMPLETE.
+  // Find the lead byte of the last character, work out how many bytes
+  // that character needs, and cut only if the buffer ran out before it
+  // finished. (Naively stripping continuation bytes would destroy a
+  // perfectly valid character that happens to land at the end.)
+  char* b = logBuf[logCount];
+  const int n = strlen(b);
+  int i = n - 1;
+  while (i >= 0 && ((unsigned char)b[i] & 0xC0) == 0x80) i--;   // to the lead byte
+  if (i >= 0) {
+    const unsigned char lead = (unsigned char)b[i];
+    int need;
+    if      ((lead & 0x80) == 0x00) need = 1;   // ASCII
+    else if ((lead & 0xE0) == 0xC0) need = 2;
+    else if ((lead & 0xF0) == 0xE0) need = 3;   // em-dash lives here
+    else if ((lead & 0xF8) == 0xF0) need = 4;
+    else                            need = 1;   // stray byte; leave as-is
+    if (i + need > n) b[i] = '\0';              // incomplete -> drop it
+  }
+
+  logCount++;
+}
+
+/// JSON string escaping — quotes, backslashes and control characters.
+/// Without this a log line containing a quote would produce a malformed
+/// body and PostgREST would reject the whole batch.
+String jsonEscape(const char* s) {
+  String out;
+  out.reserve(strlen(s) + 8);
+  for (const char* p = s; *p; p++) {
+    switch (*p) {
+      case '"':  out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n";  break;
+      case '\r': out += "\\r";  break;
+      case '\t': out += "\\t";  break;
+      default:
+        if ((unsigned char)*p < 0x20) {
+          char esc[7];
+          snprintf(esc, sizeof(esc), "\\u%04x", (unsigned char)*p);
+          out += esc;
+        } else {
+          out += *p;
         }
     }
+  }
+  return out;
+}
 
-    void softBeep() {
-        ledcWrite(PIN_PIEZZO, PIEZO_VOLUME_DUTY);
-        delay(60);
-        ledcWrite(PIN_PIEZZO, 0);
-        delay(80);
-        ledcWrite(PIN_PIEZZO, PIEZO_VOLUME_DUTY);
-        delay(60);
-        ledcWrite(PIN_PIEZZO, 0);
+/// Bulk-insert the queued lines. PostgREST takes a JSON array, so the
+/// whole batch is one request rather than one per line.
+void flushLogs() {
+  if (logCount == 0 && !logOverflowed) return;
+  if (WiFi.status() != WL_CONNECTED) {
+    // Nothing can be sent, so drop the queue rather than letting it
+    // block every later line until the WiFi returns.
+    logCount = 0;
+    logOverflowed = false;
+    return;
+  }
+
+  String body = "[";
+  if (logOverflowed) {
+    body += "{\"device_id\":\"" DEVICE_ID "\",\"message\":\"";
+    body += "[lines dropped — device log buffer full]\"},";
+  }
+  for (int i = 0; i < logCount; i++) {
+    if (i) body += ",";
+    body += "{\"device_id\":\"" DEVICE_ID "\",\"message\":\"";
+    body += jsonEscape(logBuf[i]);
+    body += "\"}";
+  }
+  body += "]";
+
+  // Clear the queue BEFORE the request: a failed upload must not make
+  // the same lines retry forever, and logLine() is free to fill the
+  // buffer again while this is in flight.
+  logCount = 0;
+  logOverflowed = false;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  String url = String(SUPABASE_URL) + "/rest/v1/device_logs";
+  if (!http.begin(client, url)) return;
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("apikey", SUPABASE_KEY);
+  http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
+  http.addHeader("Prefer", "return=minimal");
+  http.setTimeout(10000);
+
+  const int code = http.POST(body);
+  if (!(code == 200 || code == 201 || code == 204)) {
+    // Serial only — logging a failed log upload through logLine() would
+    // queue a line that the next flush tries to send, and so on.
+    Serial.print("[Cloud] device_logs insert -> HTTP ");
+    Serial.println(code);
+  }
+  http.end();
+}
+
+
+// =====================================================
+// WIFI
+// =====================================================
+
+void startWiFi() {
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("WIFI CONNECTION");
+  Serial.println("================================");
+  Serial.print("SSID: ");
+  Serial.println(ssid);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
+  digitalWrite(WIFI_LED_PIN, LOW);
+
+  Serial.println("WiFi: connecting...");
+  WiFi.begin(ssid, password);
+  lastWiFiAttempt = millis();
+}
+
+void checkWiFi() {
+  bool connected = (WiFi.status() == WL_CONNECTED);
+
+  if (connected) {
+    digitalWrite(WIFI_LED_PIN, HIGH);
+    if (!lastWiFiState) {
+      lastWiFiState = true;
+      logLine("WiFi: connected");
+      logLine("IP address: " + WiFi.localIP().toString());
+      logLine("Signal strength: " + String(WiFi.RSSI()) + " dBm");
+
+      // (Re)sync the clock each time we regain WiFi.
+      configTime(NTP_GMT_OFFSET, NTP_DST_OFFSET, "pool.ntp.org", "time.nist.gov");
+    }
+    return;
+  }
+
+  digitalWrite(WIFI_LED_PIN, LOW);
+  if (lastWiFiState) {
+    lastWiFiState = false;
+    // Serial only: there is no link to send it over right now, and by
+    // the time there is, the "connected" line says the same thing.
+    Serial.println();
+    Serial.println("WiFi: disconnected");
+  }
+
+  if (millis() - lastWiFiAttempt >= WIFI_RETRY_INTERVAL) {
+    lastWiFiAttempt = millis();
+    Serial.println();
+    Serial.println("WiFi: retrying...");
+    WiFi.disconnect();
+    delay(100);
+    WiFi.begin(ssid, password);
+  }
+}
+
+
+// =====================================================
+// READ SENSORS
+// =====================================================
+//
+// Formulas here are the bench sketch's, unchanged. What is added is the
+// per-sensor validity the app needs in order to show a real "Not
+// Connected" state instead of a stale number — with the grace window
+// described at SENSOR_GRACE_MS so a single dropped read is not treated
+// as a disconnected sensor.
+
+void readSensors() {
+
+  const unsigned long now = millis();
+
+  // ---------------- DS18B20 water temp ----------------
+  waterTempSensor.requestTemperatures();
+  float wt = waterTempSensor.getTempCByIndex(0);
+  const bool wtOk = (wt != DEVICE_DISCONNECTED_C && wt > -50.0 && wt < 100.0);
+  if (wtOk) {
+    waterTemperature  = wt;          // keep the last good value (bench behaviour)
+    lastWaterTempOk   = now;
+    waterTempEverRead = true;
+  }
+  waterTempValid = waterTempEverRead && (now - lastWaterTempOk <= SENSOR_GRACE_MS);
+
+  // ---------------- DHT11 housing/ambient -------------
+  float newHumidity       = dht.readHumidity();
+  float newAirTemperature = dht.readTemperature();
+  const bool dhtOk = (!isnan(newHumidity) && !isnan(newAirTemperature));
+  if (dhtOk) {
+    humidity        = newHumidity;   // keep the last good value (bench behaviour)
+    airTemperature  = newAirTemperature;
+    lastAmbientOk   = now;
+    ambientEverRead = true;
+  }
+  ambientValid = ambientEverRead && (now - lastAmbientOk <= SENSOR_GRACE_MS);
+
+  // ---------------- Turbidity (SEN0189) ---------------
+  turbidityADC = analogRead(TURBIDITY_PIN);
+  turbidityADCVoltage = (turbidityADC / 4095.0) * 3.3;
+  // Any ADC level is a legitimate turbidity reading — a blocked sensor
+  // (very turbid) can read a very low voltage, which must still show as
+  // 100%, not "Not Connected". Whole-device offline is handled by the
+  // app's connection state, so turbidity itself is always valid here.
+  turbidityValid = true;
+
+  relativeTurbidity =
+    ((V_CLEAR - turbidityADCVoltage) / (V_CLEAR - V_HIGH)) * 100.0;
+  relativeTurbidity = constrain(relativeTurbidity, 0.0, 100.0);
+
+  if      (turbidityADCVoltage >= TURBIDITY_T1) turbidityStatus = "Clear";
+  else if (turbidityADCVoltage >= TURBIDITY_T2) turbidityStatus = "Slightly Turbid";
+  else if (turbidityADCVoltage >= TURBIDITY_T3) turbidityStatus = "Turbid";
+  else                                          turbidityStatus = "Highly Turbid";
+
+  // ---------------- pH (3-point) ----------------------
+  phADC = analogRead(PH_PIN);
+  const float phADCVoltage = (phADC / 4095.0) * 3.3;
+  phPinVoltage = phADCVoltage;
+  phVoltage = phADCVoltage * PH_DIVIDER_RATIO;
+  // A probe that is unplugged reads pinned at one rail; anything inside
+  // the rails is a real measurement.
+  phValid = (phADCVoltage > 0.05 && phADCVoltage < 3.25);
+
+  if (phVoltage >= voltage_pH7) {
+    pH = 7.0 + (phVoltage - voltage_pH7) * (4.0 - 7.0) /
+               (voltage_pH4 - voltage_pH7);
+  } else {
+    pH = 7.0 + (phVoltage - voltage_pH7) * (9.18 - 7.0) /
+               (voltage_pH9 - voltage_pH7);
+  }
+  pH = constrain(pH, 0.0, 14.0);
+
+  // ---------------- MQ-137 ammonia --------------------
+  ammoniaADC = analogRead(AMMONIA_PIN);
+  ammoniaADCVoltage    = (ammoniaADC / 4095.0) * 3.3;
+  ammoniaSensorVoltage = ammoniaADCVoltage * AMMONIA_DIVIDER_RATIO;
+  // "Valid" = the sensor is electrically present (reading something).
+  // This does NOT depend on the calibration band, so the app shows a
+  // number instead of "Not Connected" when the MQ-137 sits outside it.
+  ammoniaValid = (ammoniaADCVoltage > 0.02);
+
+  // NH4/NH3 estimate (mg/L) — the bench sketch's two-segment
+  // interpolation across the Sera reference points, CLAMPED to the span
+  // those points cover. Outside the band the reading is reported at the
+  // nearest calibrated end and flagged "[est]"; this firmware does not
+  // extrapolate a concentration it has never been calibrated for.
+  const float v = ammoniaSensorVoltage;
+  ammoniaInCalibrationRange = (v >= AMMONIA_V0 && v <= AMMONIA_V2);
+
+  if (v <= AMMONIA_V0) {
+    ammoniaEstimatedMgL = AMMONIA_C0;
+  } else if (v <= AMMONIA_V1) {
+    ammoniaEstimatedMgL = AMMONIA_C0 +
+        (v - AMMONIA_V0) * (AMMONIA_C1 - AMMONIA_C0) / (AMMONIA_V1 - AMMONIA_V0);
+  } else if (v <= AMMONIA_V2) {
+    ammoniaEstimatedMgL = AMMONIA_C1 +
+        (v - AMMONIA_V1) * (AMMONIA_C2 - AMMONIA_C1) / (AMMONIA_V2 - AMMONIA_V1);
+  } else {
+    ammoniaEstimatedMgL = AMMONIA_C2;   // above the top reference: clamp, don't invent
+  }
+}
+
+
+// =====================================================
+// COOLING FAN (Motor 2) — automatic
+// =====================================================
+
+void controlCoolingMotor() {
+  int pwm = 0;
+
+  // Same ramp as the bench sketch, driven by the last-good housing
+  // temperature. Only a genuinely dead DHT11 (silent past the grace
+  // window) holds the fan OFF — a single dropped read must not cut
+  // cooling, which is what used to happen here.
+  if (!ambientValid) {
+    pwm = 0;
+  } else if (airTemperature < COOLING_START) {
+    pwm = 0;
+  } else if (airTemperature < COOLING_MAX) {
+    pwm = map(airTemperature * 10, COOLING_START * 10, COOLING_MAX * 10,
+              COOLING_MIN_PWM, COOLING_MAX_PWM);
+  } else {
+    pwm = COOLING_MAX_PWM;
+  }
+
+  pwm = constrain(pwm, 0, 255);
+  motor2PWM = pwm;
+  fanActive = (pwm > 0);
+  analogWrite(MOTOR2_EN, motor2PWM);
+}
+
+
+// =====================================================
+// DC ROTATOR (Motor 1) — runs after each feed
+// =====================================================
+
+/// Run the rotator at [pwm] for [ms], then stop. [pwm] comes from the
+/// app's rotator-speed selection; 0 means "do not rotate at all", which
+/// is a legitimate choice for a feed.
+/// Start the post-feed rotation and return immediately. The feed is
+/// only finished once serviceRotator() stops the motor, so
+/// feedInProgress stays true until then.
+void startRotator(unsigned long ms, int pwm) {
+  pwm = constrain(pwm, 0, 255);
+
+  if (pwm == 0 || ms == 0) {
+    logLine("[Feed] Rotator -> skipped (speed set to Off)");
+    finishFeed();
+    return;
+  }
+
+  logLine("[Feed] Rotator -> ON at " + String((int)((pwm / 255.0) * 100)) +
+          "% for " + String(ms / 1000.0, 1) + " s");
+  motor1PWM = pwm;
+  analogWrite(MOTOR1_EN, motor1PWM);
+
+  rotatorStopAt = millis() + ms;
+  // millis() wraps to 0 after ~49 days and 0 is the idle sentinel.
+  if (rotatorStopAt == 0) rotatorStopAt = 1;
+}
+
+/// Stop the rotator once its deadline passes. Called every loop pass.
+void serviceRotator() {
+  if (rotatorStopAt == 0) return;
+  if ((long)(millis() - rotatorStopAt) < 0) return;
+
+  rotatorStopAt = 0;
+  motor1PWM = 0;
+  analogWrite(MOTOR1_EN, motor1PWM);
+  logLine("[Feed] Rotator -> OFF");
+  finishFeed();
+}
+
+/// Release the feed lock and hand the LCD back to its page cycle.
+void finishFeed() {
+  logLine("[Feed] Cycle complete");
+  lastLCDUpdate = 0;
+  feedInProgress = false;
+}
+
+
+// =====================================================
+// TEST COMPONENTS: direct actuator control
+// =====================================================
+
+void servoTest(bool open) {
+  if (feedInProgress) {
+    logLine("[Test] Servo ignored — a feed is running");
+    return;
+  }
+
+  if (open) {
+    myServo.write(SERVO_OPEN_ANGLE);
+    servoPosition = SERVO_OPEN_ANGLE;
+    servoTestOpenedAt = millis();
+    logLine("[Test] Servo -> OPEN " + String(SERVO_OPEN_ANGLE) + " degrees");
+  } else {
+    myServo.write(SERVO_CLOSED_ANGLE);
+    servoPosition = SERVO_CLOSED_ANGLE;
+    servoTestOpenedAt = 0;
+    logLine("[Test] Servo -> CLOSED " + String(SERVO_CLOSED_ANGLE) + " degrees");
+  }
+}
+
+void motorTest(int pwm) {
+  if (feedInProgress) {
+    logLine("[Test] Motor ignored — a feed is running");
+    return;
+  }
+
+  motor1PWM = constrain(pwm, 0, 255);
+  analogWrite(MOTOR1_EN, motor1PWM);
+  motorTestStartedAt = (motor1PWM > 0) ? millis() : 0;
+
+  logLine("[Test] Rotator -> " + String(motor1PWM) + "/255 (" +
+          String((int)((motor1PWM / 255.0) * 100)) + "%)");
+}
+
+/// Enforce the deadlines above. Called every loop pass.
+void checkTestTimeouts() {
+  if (servoTestOpenedAt != 0 &&
+      millis() - servoTestOpenedAt >= SERVO_TEST_MAX_OPEN_MS) {
+    myServo.write(SERVO_CLOSED_ANGLE);
+    servoPosition = SERVO_CLOSED_ANGLE;
+    servoTestOpenedAt = 0;
+    logLine("[Test] Servo auto-closed after 10 s");
+  }
+
+  if (motorTestStartedAt != 0 &&
+      millis() - motorTestStartedAt >= MOTOR_TEST_MAX_MS) {
+    motor1PWM = 0;
+    analogWrite(MOTOR1_EN, motor1PWM);
+    motorTestStartedAt = 0;
+    logLine("[Test] Rotator auto-stopped after 30 s");
+  }
+}
+
+
+// =====================================================
+// FEED CYCLE: servo drop -> settle -> rotate
+// =====================================================
+
+void doFeed(int grams, int rotatorPwm) {
+  if (feedInProgress) {
+    logLine("[Feed] Ignored — a feed is already running");
+    return;
+  }
+  feedInProgress = true;
+
+  // A feed owns both actuators, so cancel any test deadline rather than
+  // letting a timer fire part-way through the cycle.
+  servoTestOpenedAt = 0;
+  motorTestStartedAt = 0;
+
+  unsigned long openMs = gramsToOpenMs(grams);
+
+  logLine("[Feed] Dispensing " + String(grams) + " g  (open " +
+          String(openMs) + " ms, rotator " +
+          String((int)((constrain(rotatorPwm, 0, 255) / 255.0) * 100)) + "%)");
+
+  // The whole cycle blocks for up to ~6 s, so the LCD would otherwise
+  // sit frozen on whatever page it happened to be showing. Say what is
+  // happening instead — this is the one moment the machine moves.
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Feeding ");
+  lcd.print(grams);
+  lcd.print("g");
+  lcd.setCursor(0, 1);
+  lcd.print("Dispensing...");
+
+  // 1-3: servo opens, holds for the gram time, closes.
+  myServo.write(SERVO_OPEN_ANGLE);
+  servoPosition = SERVO_OPEN_ANGLE;
+  delay(openMs);
+  myServo.write(SERVO_CLOSED_ANGLE);
+  servoPosition = SERVO_CLOSED_ANGLE;
+
+  // 4: wait for the feed to drop.
+  logLine("[Feed] Settling 1.5 s before rotating...");
+  lcd.setCursor(0, 1);
+  lcd.print("Settling...  ");
+  delay(FEED_SETTLE_MS);
+
+  // 5: start the rotation and return. serviceRotator() stops the
+  // motor when its deadline passes and clears feedInProgress then —
+  // loop() keeps running throughout, so the cloud layer stays alive.
+  lcd.setCursor(0, 1);
+  lcd.print("Rotating...  ");
+  startRotator(ROTATOR_RUN_MS, rotatorPwm);
+}
+
+
+// =====================================================
+// CLOUD: push one reading
+// =====================================================
+
+void pushReading() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  WiFiClientSecure client;
+  client.setInsecure();   // thesis simplicity; pin the CA cert for production-grade TLS
+
+  HTTPClient http;
+  String url = String(SUPABASE_URL) + "/rest/v1/readings";
+  if (!http.begin(client, url)) {
+    Serial.println("[Cloud] readings insert begin() failed");
+    return;
+  }
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("apikey", SUPABASE_KEY);
+  http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
+  http.addHeader("Prefer", "return=minimal");
+  http.setTimeout(10000);
+
+  // Postgres columns are snake_case.
+  StaticJsonDocument<512> doc;
+  doc["device_id"]        = DEVICE_ID;
+  doc["ph"]               = serialized(String(pH, 2));
+  doc["ammonia"]          = serialized(String(ammoniaEstimatedMgL, 2));  // mg/L
+  doc["turbidity"]        = serialized(String(relativeTurbidity, 1));    // percent
+  doc["turbidity_status"] = turbidityStatus;
+  doc["water_temp_c"]     = serialized(String(waterTemperature, 1));
+  doc["ambient_temp_c"]   = serialized(String(airTemperature, 1));       // Housing temp
+  doc["fan_active"]       = fanActive;
+  doc["fan_percent"]      = (int)((motor2PWM / 255.0) * 100.0);
+  doc["ph_valid"]         = phValid;
+  doc["turbidity_valid"]  = turbidityValid;
+  doc["water_temp_valid"] = waterTempValid;
+  doc["ambient_valid"]    = ambientValid;
+  doc["ammonia_valid"]    = ammoniaValid;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  int code = http.POST(payload);
+  if (code == 200 || code == 201 || code == 204) {
+    // Verbose: one of these every 10 s forever, so it only reaches the
+    // app's console while somebody is watching it.
+    logLine("[Cloud] Reading stored", true);
+  } else {
+    logLine("[Cloud] readings insert -> HTTP " + String(code));
+    logLine(http.getString());   // PostgREST prints the reason
+  }
+  http.end();
+}
+
+
+// =====================================================
+// CLOUD: poll + execute the next pending command
+// =====================================================
+//
+// One command per poll, oldest first. Each command is marked handled
+// BEFORE the feed runs: a reset or brown-out mid-dispense then loses
+// that one feed instead of replaying it on every boot. For a feeder,
+// under-feeding once is the recoverable failure; repeat-feeding is not.
+
+void pollCommands() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (feedInProgress) return;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  String url = String(SUPABASE_URL) +
+               "/rest/v1/commands?select=id,type,grams,value,rotator_pwm,created_at"
+               "&device_id=eq." + DEVICE_ID +
+               "&handled=eq.false&order=created_at.asc&limit=1";
+  if (!http.begin(client, url)) return;
+  http.addHeader("apikey", SUPABASE_KEY);
+  http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
+  http.setTimeout(10000);
+
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    return;
+  }
+
+  String body = http.getString();
+  http.end();
+
+  // PostgREST returns a bare JSON array, e.g. [ { "id": "...", ... } ].
+  StaticJsonDocument<1024> doc;
+  if (deserializeJson(doc, body)) return;
+
+  JsonArray cmds = doc.as<JsonArray>();
+  if (cmds.isNull() || cmds.size() == 0) return;
+
+  JsonObject c = cmds[0];
+  String id   = c["id"].as<String>();
+  String type = c["type"].as<String>();
+
+  // Mark it handled first; if that PATCH fails, leave the command alone
+  // and retry next poll rather than dispensing a feed we cannot ack.
+  if (!ackCommand(id)) {
+    Serial.println("[Cmd] ack failed — not running this command yet");
+    return;
+  }
+
+  // ---------------- feed ----------------
+  if (type == "feed_now") {
+    const long ageS = commandAgeSeconds(c["created_at"].as<String>());
+    if (ageS >= 0 && ageS > FEED_COMMAND_MAX_AGE_S) {
+      logLine("[Cmd] feed_now dropped — queued " + String(ageS) + " s ago (stale)");
+      return;
     }
 
-    void beepConnecting() {
-        ledcWrite(PIN_PIEZZO, PIEZO_VOLUME_DUTY / 2);
-        delay(40);
-        ledcWrite(PIN_PIEZZO, 0);
+    const int grams = c["grams"] | 10;
+    // A row written before rotator_pwm existed sends null; fall back to
+    // what this firmware always used to do, which is full speed.
+    const int pwm = c["rotator_pwm"] | 255;
+    logLine("[Cmd] feed_now " + String(grams) + " g");
+    doFeed(grams, pwm);
+    return;
+  }
+
+  // ---------------- Test Components ----------------
+  //
+  // These are deliberately NOT age-checked: they are only ever sent
+  // from a screen somebody is looking at, and the actuator deadlines in
+  // checkTestTimeouts() already bound how long one can have an effect.
+
+  if (type == "servo_open") {
+    servoTest(true);
+    return;
+  }
+
+  if (type == "servo_close") {
+    servoTest(false);
+    return;
+  }
+
+  if (type == "motor_test") {
+    motorTest(c["value"] | 0);
+    return;
+  }
+
+  if (type == "log_stream") {
+    long secs = c["value"] | 0;
+    if (secs <= 0) {
+      logStreamUntil = 0;
+      logLine("[Cmd] log_stream off");
+    } else {
+      if (secs > (long)LOG_STREAM_MAX_S) secs = LOG_STREAM_MAX_S;
+      logStreamUntil = millis() + (unsigned long)secs * 1000UL;
+      // millis() rolls over to 0 after ~49 days; a deadline of exactly
+      // 0 is the sentinel for "off", so nudge past it.
+      if (logStreamUntil == 0) logStreamUntil = 1;
+      logLine("[Cmd] log_stream on for " + String(secs) + " s");
     }
+    return;
+  }
 
-    void beepSuccess() {
-        ledcWriteTone(PIN_PIEZZO, 1400);
-        delay(80);
-        ledcWriteTone(PIN_PIEZZO, 2000);
-        delay(100);
-        ledcWrite(PIN_PIEZZO, 0);
+  logLine("[Cmd] unknown type: " + type);
+}
+
+/// Age of a PostgREST `created_at` timestamp in seconds, or -1 when the
+/// clock has not synced yet / the timestamp cannot be parsed (in which
+/// case the caller treats the command as fresh rather than dropping it).
+long commandAgeSeconds(const String& createdAt) {
+  if (!timeSynced || createdAt.length() < 19) return -1;
+
+  struct tm t = {};
+  // "2026-10-17T09:41:05.123456+00:00" — parse the UTC calendar part.
+  if (sscanf(createdAt.c_str(), "%4d-%2d-%2dT%2d:%2d:%2d",
+             &t.tm_year, &t.tm_mon, &t.tm_mday,
+             &t.tm_hour, &t.tm_min, &t.tm_sec) != 6) {
+    return -1;
+  }
+  t.tm_year -= 1900;
+  t.tm_mon  -= 1;
+  t.tm_isdst = 0;
+
+  // created_at is UTC, but mktime() reads a struct tm as LOCAL time.
+  // Since local is UTC+8, mktime() returns (true epoch - 28800), so the
+  // offset is added back rather than subtracted. Getting this sign
+  // wrong puts every command 16 hours into the past, which would make
+  // the staleness check below drop all of them.
+  time_t created = mktime(&t) + NTP_GMT_OFFSET;
+  time_t now = time(nullptr);
+  if (now <= 0 || created <= 0) return -1;
+
+  const long age = (long)difftime(now, created);
+  // A negative age means the device clock is behind the server's, not
+  // that the command is from the future — treat it as fresh.
+  return age < 0 ? 0 : age;
+}
+
+bool ackCommand(const String& id) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  // PATCH the one row: mark it handled so it isn't run twice.
+  String url = String(SUPABASE_URL) + "/rest/v1/commands?id=eq." + id;
+  if (!http.begin(client, url)) return false;
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("apikey", SUPABASE_KEY);
+  http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
+  http.addHeader("Prefer", "return=minimal");
+  http.setTimeout(10000);
+
+  // Only `handled` is set here. handled_at is left to the database (a
+  // JSON string like "now()" is not a timestamptz literal, so sending
+  // one would make PostgREST reject the whole PATCH with a 400).
+  String payload = "{\"handled\":true}";
+  int code = http.sendRequest("PATCH", payload);   // no PATCH() helper on all cores
+  http.end();
+
+  const bool ok = (code == 200 || code == 204);
+  if (!ok) {
+    Serial.print("[Cloud] command ack -> HTTP ");
+    Serial.println(code);
+  }
+  return ok;
+}
+
+
+// =====================================================
+// CLOUD: refresh feeding schedules
+// =====================================================
+
+void refreshSchedules() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  String url = String(SUPABASE_URL) +
+               "/rest/v1/schedules?select=id,time,grams,rotator_pwm,active"
+               "&device_id=eq." + DEVICE_ID + "&active=eq.true";
+  if (!http.begin(client, url)) return;
+  http.addHeader("apikey", SUPABASE_KEY);
+  http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
+  http.setTimeout(10000);
+
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    return;
+  }
+
+  String body = http.getString();
+  http.end();
+
+  // PostgREST returns a bare JSON array.
+  StaticJsonDocument<2048> doc;
+  if (deserializeJson(doc, body)) return;
+
+  JsonArray arr = doc.as<JsonArray>();
+  scheduleCount = 0;
+  for (JsonObject s : arr) {
+    if (scheduleCount >= MAX_SCHEDULES) break;
+    String t = s["time"].as<String>();
+    strncpy(schedules[scheduleCount].time, t.c_str(), 5);
+    schedules[scheduleCount].time[5] = '\0';
+    schedules[scheduleCount].grams      = s["grams"] | 10;
+    schedules[scheduleCount].rotatorPwm = s["rotator_pwm"] | 255;
+    schedules[scheduleCount].active     = s["active"] | true;
+    scheduleCount++;
+  }
+  logLine("[Cloud] Schedules loaded: " + String(scheduleCount));
+}
+
+
+// =====================================================
+// SCHEDULED FEEDING  (fires each active schedule at its HH:MM)
+// =====================================================
+
+void checkScheduledFeeding() {
+  struct tm t;
+  if (!getLocalTime(&t, 50)) return;   // clock not ready yet
+  timeSynced = true;
+
+  int minuteOfDay = t.tm_hour * 60 + t.tm_min;
+  if (minuteOfDay == lastFedMinuteOfDay) return;   // already handled this minute
+
+  char now[6];
+  snprintf(now, sizeof(now), "%02d:%02d", t.tm_hour, t.tm_min);
+
+  for (int i = 0; i < scheduleCount; i++) {
+    if (!schedules[i].active) continue;
+    if (strcmp(schedules[i].time, now) == 0) {
+      logLine("[Schedule] " + String(now) + " -> feed " +
+              String(schedules[i].grams) + " g");
+      lastFedMinuteOfDay = minuteOfDay;   // claim the minute BEFORE the
+                                          // blocking feed, so two rows at
+                                          // the same HH:MM cannot double-feed
+      doFeed(schedules[i].grams, schedules[i].rotatorPwm);
+      return;
     }
+  }
+}
 
-    void beepFailure() {
-        ledcWriteTone(PIN_PIEZZO, 1000);
-        delay(120);
-        ledcWriteTone(PIN_PIEZZO, 600);
-        delay(150);
-        ledcWrite(PIN_PIEZZO, 0);
-    }
 
-    void beepServerConnecting() {
-        ledcWriteTone(PIN_PIEZZO, 900);
-        delay(50);
-        ledcWriteTone(PIN_PIEZZO, 1100);
-        delay(50);
-        ledcWriteTone(PIN_PIEZZO, 1300);
-        delay(50);
-        ledcWrite(PIN_PIEZZO, 0);
-    }
+// =====================================================
+// MOTOR 1 — manual helper (bench-sketch serial testing)
+// =====================================================
 
-    void beepServerSuccess() {
-        ledcWriteTone(PIN_PIEZZO, 1200);
-        delay(90);
-        ledcWriteTone(PIN_PIEZZO, 1600);
-        delay(90);
-        ledcWriteTone(PIN_PIEZZO, 2200);
-        delay(140);
-        ledcWrite(PIN_PIEZZO, 0);
-    }
+void setMotor1(int pwm) {
+  motor1PWM = constrain(pwm, 0, 255);
+  analogWrite(MOTOR1_EN, motor1PWM);
+  // Same deadline as a motor_test from the app: a bench key must not
+  // leave the rotator running either.
+  motorTestStartedAt = (motor1PWM > 0) ? millis() : 0;
+  logLine("Motor 1 (rotator) PWM: " + String(motor1PWM) + " / 255   " +
+          String((int)((motor1PWM / 255.0) * 100.0)) + "%");
+}
 
-    void beepServerFailure() {
-        ledcWriteTone(PIN_PIEZZO, 700);
-        delay(100);
-        ledcWriteTone(PIN_PIEZZO, 500);
-        delay(100);
-        ledcWriteTone(PIN_PIEZZO, 300);
-        delay(180);
-        ledcWrite(PIN_PIEZZO, 0);
-    }
 
-    void beepBootJingle() {
-        const int notes[] = { 523, 659, 784, 1047 };
-        const int noteDurationMs = 90;
-        const int gapMs = 20;
+// =====================================================
+// SERIAL COMMANDS (local bench testing only — the real
+// control path is the mobile app via Supabase)
+// =====================================================
+//
+// Key map matches the bench sketch's PRINTED guide (its if-chain
+// compared single chars against "10"/"11", which can never match):
+//
+//   FEED:   7=5g  8=10g  9=15g  a=20g  b=25g  c=30g
+//   MOTOR1: 2=OFF 3=25%  4=50%  5=75%  6=100%
 
-        for (int i = 0; i < 4; i++) {
-            ledcWriteTone(PIN_PIEZZO, notes[i]);
-            delay(noteDurationMs);
-            ledcWrite(PIN_PIEZZO, 0);
-            delay(gapMs);
-        }
-        ledcWriteTone(PIN_PIEZZO, 1047);
-        delay(60);
-        ledcWrite(PIN_PIEZZO, 0);
-        delay(40);
-        ledcWriteTone(PIN_PIEZZO, 1319);
-        delay(120);
-        ledcWrite(PIN_PIEZZO, 0);
-    }
+void checkSerialCommand() {
+  if (!Serial.available()) return;
+  char command = Serial.read();
 
-    void beepTriggerReceived() {
-        ledcWriteTone(PIN_PIEZZO, 1500);
-        delay(50);
-        ledcWrite(PIN_PIEZZO, 0);
-        delay(60);
-        ledcWriteTone(PIN_PIEZZO, 1500);
-        delay(50);
-        ledcWrite(PIN_PIEZZO, 0);
-    }
-};
+  // Bench feeds use full rotator speed, matching what the bench sketch
+  // does. The app is where the speed becomes selectable.
+  if      (command == '7') doFeed(5,  255);
+  else if (command == '8') doFeed(10, 255);
+  else if (command == '9') doFeed(15, 255);
+  else if (command == 'a') doFeed(20, 255);
+  else if (command == 'b') doFeed(25, 255);
+  else if (command == 'c') doFeed(30, 255);
+  else if (command == '2') setMotor1(0);
+  else if (command == '3') setMotor1(90);
+  else if (command == '4') setMotor1(128);
+  else if (command == '5') setMotor1(191);
+  else if (command == '6') setMotor1(255);
+}
 
-// ===================================================================
-//  GLOBAL OBJECTS
-// ===================================================================
 
-// SystemState/CONNECTING/etc. simplified - the device is either
-// still starting up, or fully running (connected to WiFi and serving
-// local requests). There's no backend to fail to reach anymore, no
-// "provisioned" concept - just WiFi connected or not.
-enum class SystemState : uint8_t { STARTING, RUNNING };
-SystemState systemState = SystemState::STARTING;
+// =====================================================
+// AMMONIA STATUS (mg/L -> label), used on LCD + serial
+// =====================================================
+//
+// Bench-sketch bands. Mirrored by the app in firmware_spec.dart.
 
-LcdDashboard     lcdDashboard;
-StatusIndicator  statusIndicator;
+String getAmmoniaStatus(float mgL) {
+  if (mgL < 0.25) return "Safe";
+  if (mgL < 0.50) return "Warning";
+  return "Critical";
+}
 
-SensorManager    sensorManager;
-FeedingMechanism feedingMechanism;
-FanController    fanController;
 
-SensorReadings   latestReadings;
-LocalApiServer*  localApiServer = nullptr;
-bool             phoneWasConnected = false;   // tracks the LAST known station count, so we only act on genuine transitions
+// =====================================================
+// SERIAL SENSOR MONITOR
+// =====================================================
 
-constexpr int TOTAL_COMPONENTS = 8;
-bool componentOK[TOTAL_COMPONENTS];
+// Built as whole lines so each one can go to Serial AND to the app's
+// console through logLine(). These are the high-volume lines (every
+// SENSOR_INTERVAL), so they are marked verbose: Serial always gets
+// them, the cloud only while log streaming is on.
+#define LOG_V(s) logLine((s), true)
 
-unsigned long lastLocalLoop = 0;
-unsigned long lastSensorTime = 0, lastFeedingTime = 0, lastHealthCheck = 0;
+void printSensorData() {
+  Serial.println();
+  LOG_V("========== SENSOR DATA ==========");
 
-void runHealthCheck(const SensorReadings& r);
-int  countWorking();
+  LOG_V("Water Temp: " +
+        (waterTempValid ? String(waterTemperature) + " C" : String("Not Connected")));
 
-// ===================================================================
-//  SETUP
-// ===================================================================
+  LOG_V("Housing Temp: " +
+        (ambientValid ? String(airTemperature) + " C" : String("Not Connected")));
+
+  LOG_V("Humidity:   " +
+        (ambientValid ? String(humidity) + " %" : String("Not Connected")));
+
+  if (turbidityValid) {
+    LOG_V("Turbidity:  " + String(relativeTurbidity, 2) + "% (" + turbidityStatus +
+          ")   |   ADC: " + String(turbidityADC) +
+          "   ADC V: " + String(turbidityADCVoltage, 3) + " V");
+  } else {
+    LOG_V("Turbidity:  Not Connected");
+  }
+
+  if (phValid) {
+    LOG_V("pH:         " + String(pH, 2) +
+          "   |   ADC: " + String(phADC) +
+          "   pin: " + String(phPinVoltage, 3) + " V" +
+          "   probe: " + String(phVoltage, 3) + " V");
+  } else {
+    LOG_V("pH:         Not Connected   |   ADC: " + String(phADC) +
+          "   pin: " + String(phPinVoltage, 3) + " V");
+  }
+
+  if (ammoniaValid) {
+    String line = "Ammonia:    " + String(ammoniaEstimatedMgL, 2) + " mg/L (" +
+                  getAmmoniaStatus(ammoniaEstimatedMgL) + ")";
+    if (!ammoniaInCalibrationRange) line += " [est — outside calibrated band]";
+    line += "   |   Sensor: " + String(ammoniaSensorVoltage, 3) + " V";
+    LOG_V(line);
+  } else {
+    LOG_V("Ammonia:    Not Connected");
+  }
+
+  LOG_V("Fan:        " + String(fanActive ? "ON " : "OFF ") +
+        String((int)((motor2PWM / 255.0) * 100.0)) + "%");
+
+  LOG_V("Rotator:    " + String((int)((motor1PWM / 255.0) * 100.0)) + "%");
+
+  LOG_V("=================================");
+}
+
+
+// =====================================================
+// LCD DISPLAY
+// =====================================================
+
+void updateLCD() {
+  lcd.clear();
+
+  switch (lcdPage) {
+
+    case 0:  // Water temp + pH
+      lcd.setCursor(0, 0);
+      lcd.print("Water:");
+      if (waterTempValid) { lcd.print(waterTemperature, 1); lcd.print((char)223); lcd.print("C"); }
+      else lcd.print("--");
+      lcd.setCursor(0, 1);
+      lcd.print("pH:");
+      if (phValid) lcd.print(pH, 2); else lcd.print("--");
+      break;
+
+    case 1:  // Housing temp + humidity
+      lcd.setCursor(0, 0);
+      lcd.print("House:");
+      if (ambientValid) { lcd.print(airTemperature, 1); lcd.print((char)223); lcd.print("C"); }
+      else lcd.print("--");
+      lcd.setCursor(0, 1);
+      lcd.print("Hum:");
+      if (ambientValid) { lcd.print(humidity, 1); lcd.print("%"); }
+      else lcd.print("--");
+      break;
+
+    case 2:  // Turbidity
+      lcd.setCursor(0, 0);
+      lcd.print(turbidityValid ? turbidityStatus : "Turbidity --");
+      lcd.setCursor(0, 1);
+      if (turbidityValid) { lcd.print(relativeTurbidity, 1); lcd.print("% turbid"); }
+      else lcd.print("Not Connected");
+      break;
+
+    case 3:  // Ammonia
+      lcd.setCursor(0, 0);
+      lcd.print("Ammonia mg/L");
+      lcd.setCursor(0, 1);
+      if (ammoniaValid) {
+        lcd.print(ammoniaEstimatedMgL, 2);
+        lcd.print(" ");
+        lcd.print(getAmmoniaStatus(ammoniaEstimatedMgL));
+      } else lcd.print("Not Connected");
+      break;
+
+    case 4:  // Both motors, as on the bench sketch's motor page
+      lcd.setCursor(0, 0);
+      lcd.print("Cool:");
+      lcd.print((int)((motor2PWM / 255.0) * 100.0));
+      lcd.print("% ");
+      lcd.print(fanActive ? "ON" : "OFF");
+      lcd.setCursor(0, 1);
+      lcd.print("Rotator:");
+      lcd.print((int)((motor1PWM / 255.0) * 100.0));
+      lcd.print("%");
+      break;
+  }
+
+  lcdPage++;
+  if (lcdPage > 4) lcdPage = 0;
+}
+
+
+// =====================================================
+// SETUP
+// =====================================================
 
 void setup() {
-    Serial.begin(115200);
-    delay(1000);
-    Serial.println(F("=== CRX-Pulse Boot - fully offline, no backend ==="));
+  Serial.begin(115200);
+  delay(1000);
 
-    lcdDashboard.begin();
-    statusIndicator.begin();
+  pinMode(WIFI_LED_PIN, OUTPUT);
+  digitalWrite(WIFI_LED_PIN, LOW);
 
-    lcdDashboard.showRaw("Starting the", "system...");
-    statusIndicator.beepBootJingle();
+  startWiFi();
 
-    sensorManager.begin();
-    feedingMechanism.begin();
-    fanController.begin();
-    sensorManager.beginAmmoniaWarmup();
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("CRX-PULSE (0o0)");
+  Serial.print("Firmware v"); Serial.println(FIRMWARE_VERSION);
+  Serial.println("================================");
 
-    lcdDashboard.showRaw("Starting", "WiFi...");
-    statusIndicator.setState(WifiLedState::YELLOW);
+  // ADC
+  analogReadResolution(12);
+  analogSetPinAttenuation(TURBIDITY_PIN, ADC_11db);
+  analogSetPinAttenuation(PH_PIN,        ADC_11db);
+  analogSetPinAttenuation(AMMONIA_PIN,   ADC_11db);
 
-    // Broadcasting our own network - no router, no connection
-    // attempt that can fail or time out. This always succeeds
-    // immediately; there's no "connect" step to wait on at all.
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(ESP32_AP_SSID, ESP32_AP_PASSWORD);
-    Serial.print(F("[Boot] Broadcasting: "));
-    Serial.println(ESP32_AP_SSID);
-    Serial.print(F("[Boot] Connect your phone to this network, then reach the device at: "));
-    Serial.println(WiFi.softAPIP());
+  // Sensors
+  dht.begin();
+  waterTempSensor.begin();
+  // 11-bit = 0.125 C steps and a ~375 ms conversion instead of ~750 ms.
+  // The reading is displayed to 0.1 C, so nothing is lost, and the
+  // 2-second sensor pass no longer spends most of its time blocked.
+  waterTempSensor.setResolution(11);
 
-    // Stage 1: "WiFi is activated" - the AP itself is up, solid
-    // yellow, shown briefly before moving into the waiting stage.
-    lcdDashboard.showRaw("WiFi is", "activated");
-    statusIndicator.setState(WifiLedState::YELLOW);
-    statusIndicator.beepSuccess();
-    delay(1200);
+  // LCD
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(100000);
+  delay(100);
+  lcd.init();
+  delay(100);
+  lcd.backlight();
+  delay(100);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("CRX-PULSE *(0o0)*");
+  lcd.setCursor(0, 1);
+  lcd.print("Starting...");
+  delay(1500);
+  lcd.clear();
 
-    // Stage 2: "Connecting to WiFi" - waiting for a phone to actually
-    // join the AP, blinking yellow. loop() takes over checking for
-    // the transition to Connected from here.
-    lcdDashboard.showRaw("Connecting to", "WiFi");
-    Serial.println(F("[Boot] Waiting for a phone to connect..."));
+  // Servo: reserve an LEDC timer BEFORE the analogWrite() motors, then
+  // settle CLOSED so there is no sweep from 0 at power-on.
+  ESP32PWM::allocateTimer(0);
+  myServo.setPeriodHertz(50);
+  myServo.attach(SERVO_PIN, 500, 2400);
+  myServo.write(SERVO_CLOSED_ANGLE);
+  servoPosition = SERVO_CLOSED_ANGLE;
 
-    localApiServer = new LocalApiServer(sensorManager, feedingMechanism, fanController, &latestReadings);
-    localApiServer->begin();
+  // Motor 1 (DC rotator)
+  pinMode(MOTOR1_EN, OUTPUT);
+  pinMode(MOTOR1_IN1, OUTPUT);
+  pinMode(MOTOR1_IN2, OUTPUT);
+  digitalWrite(MOTOR1_IN1, LOW);
+  digitalWrite(MOTOR1_IN2, HIGH);   // rotator spin direction
+  analogWrite(MOTOR1_EN, 0);
 
-    lastSensorTime = lastFeedingTime = lastHealthCheck = millis();
-    latestReadings = sensorManager.readAll(fanController.isActive(), fanController.getDutyPercent());
-    runHealthCheck(latestReadings);
+  // Motor 2 (cooling fan)
+  pinMode(MOTOR2_EN, OUTPUT);
+  pinMode(MOTOR2_IN1, OUTPUT);
+  pinMode(MOTOR2_IN2, OUTPUT);
+  digitalWrite(MOTOR2_IN1, HIGH);
+  digitalWrite(MOTOR2_IN2, LOW);
+  analogWrite(MOTOR2_EN, 0);
 
-    systemState = SystemState::RUNNING;
-    Serial.println(F("CRX-PULSE running standalone - connect your phone directly to this device's WiFi"));
+  // Clock for scheduled feeding
+  configTime(NTP_GMT_OFFSET, NTP_DST_OFFSET, "pool.ntp.org", "time.nist.gov");
+
+  Serial.println();
+  Serial.println("Cloud: Supabase (direct PostgREST, anon key)");
+  Serial.println("Mobile commands: feed_now {grams}");
+  Serial.println();
+  Serial.println("SERIAL BENCH KEYS");
+  Serial.println("----------------------------");
+  Serial.println("FEED:   7=5g  8=10g  9=15g  a=20g  b=25g  c=30g");
+  Serial.println("MOTOR1: 2=OFF 3=25%  4=50%  5=75%  6=100%");
+  Serial.println("Motor 2 (cooling fan) = DHT11 AUTOMATIC");
+  Serial.println("MQ-137 = GPIO35 ANALOG");
+  Serial.println("----------------------------");
 }
 
-// ===================================================================
-//  LOOP
-// ===================================================================
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
 
 void loop() {
-    sensorManager.updateAmmoniaWarmup();
-    unsigned long now = millis();
+  checkWiFi();
+  checkSerialCommand();
 
-    latestReadings = sensorManager.readAll(fanController.isActive(), fanController.getDutyPercent());
-    fanController.update(latestReadings.ambient_temp_c, latestReadings.ambientTempValid);
+  // Stop the post-feed rotation when its deadline passes.
+  serviceRotator();
 
-    // Stage 3: "Connected" - reacts to a phone ACTUALLY joining our
-    // AP (WiFi.softAPgetStationNum() > 0), not just the AP existing.
-    // Also reacts to the phone leaving again, going back to the
-    // blinking "waiting" state rather than staying falsely green.
-    bool phoneConnectedNow = WiFi.softAPgetStationNum() > 0;
-    if (phoneConnectedNow != phoneWasConnected) {
-        phoneWasConnected = phoneConnectedNow;
-        if (phoneConnectedNow) {
-            Serial.println(F("[WiFi] Phone connected"));
-            lcdDashboard.showRaw("Connected", "");
-            statusIndicator.setState(WifiLedState::GREEN);
-            statusIndicator.beepSuccess();
-        } else {
-            Serial.println(F("[WiFi] Phone disconnected - waiting again"));
-            lcdDashboard.showRaw("Connecting to", "WiFi");
-        }
-    }
-    if (!phoneConnectedNow) {
-        statusIndicator.blinkYellow(now);
-    }
+  // Close the feeder door / stop the rotator if a Test Components
+  // command left either running. Must be before anything that blocks.
+  checkTestTimeouts();
 
-    // Broadcasting our own AP always succeeds and stays up on its
-    // own - there's no "reconnect" concept the way joining someone
-    // else's router had. GREEN simply means the device finished
-    // booting and its local server is running.
-    if (localApiServer) localApiServer->handleClient();
+  // Local sensor refresh + fan control + serial print + LCD
+  if (millis() - lastSensorRead >= SENSOR_INTERVAL) {
+    lastSensorRead = millis();
+    readSensors();
+    controlCoolingMotor();
+    printSensorData();
+  }
 
-    if (now - lastSensorTime >= INTERVAL_SENSOR_MS) {
-        lastSensorTime = now;
-        sensorManager.printReadings(latestReadings);
-    }
-    if (now - lastHealthCheck >= HEALTH_CHECK_MS) {
-        lastHealthCheck = now;
-        runHealthCheck(latestReadings);
-        lcdDashboard.showDashboard(countWorking(), TOTAL_COMPONENTS);
-    }
-}
+  if (millis() - lastLCDUpdate >= LCD_INTERVAL) {
+    lastLCDUpdate = millis();
+    updateLCD();
+  }
 
-/**
- * Every slot reflects an ACTUAL, independently-checked state - no
- * slot is hardcoded true "because it should be working."
- */
-void runHealthCheck(const SensorReadings& r) {
-    componentOK[0] = r.phValid;
-    componentOK[1] = r.turbidityValid;
-    componentOK[2] = r.ammoniaValid;
-    componentOK[3] = r.waterTempValid;
-    componentOK[4] = r.ambientTempValid;
-    componentOK[5] = lcdDashboard.isResponding();
-    componentOK[6] = fanController.isActive();
-    componentOK[7] = feedingMechanism.isServoAttached();
-}
+  // Cloud: push reading
+  if (millis() - lastCloudReading >= CLOUD_READING_INTERVAL) {
+    lastCloudReading = millis();
+    pushReading();
+  }
 
-int countWorking() {
-    int count = 0;
-    for (int i = 0; i < TOTAL_COMPONENTS; i++) if (componentOK[i]) count++;
-    return count;
+  // Cloud: poll + run the next command
+  if (millis() - lastCloudCommand >= CLOUD_COMMAND_INTERVAL) {
+    lastCloudCommand = millis();
+    pollCommands();
+  }
+
+  // Cloud: refresh schedules
+  if (millis() - lastCloudSchedule >= CLOUD_SCHEDULE_INTERVAL) {
+    lastCloudSchedule = millis();
+    refreshSchedules();
+  }
+
+  // Scheduled auto-feeding (local clock vs HH:MM schedules)
+  if (millis() - lastScheduleCheck >= SCHEDULE_CHECK_INTERVAL) {
+    lastScheduleCheck = millis();
+    checkScheduledFeeding();
+  }
+
+  // Ship queued log lines to the app's console. Last, so everything
+  // this pass produced goes out in the same batch.
+  if (millis() - lastLogFlush >= LOG_FLUSH_INTERVAL) {
+    lastLogFlush = millis();
+    flushLogs();
+  }
 }

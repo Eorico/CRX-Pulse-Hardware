@@ -1,52 +1,138 @@
 # CRX-Pulse Hardware Wiring Guide
 
-Firmware version referenced: `10.0.0`. All pin numbers below are exactly what's defined in `crx_pulse.ino` — if you rewire anything, update the corresponding `#define` in the firmware to match.
+Firmware version referenced: `12.0.0` (`crx_pulse.ino`). The bench sketch `crx_pulse_test.ino` uses the **same board and the same pins** — anything below applies to both.
+
+All pin numbers here are exactly what the firmware `#define`s. If you rewire anything, change the matching `#define` too.
+
+> **Note:** an earlier revision of this document described a different board (two DS18B20 probes on a shared GPIO 4 bus, status LEDs, a piezo buzzer, a MOSFET fan on GPIO 32, and "unused" L298N pins). None of that matches this firmware. Wire to the table below, not to that older layout.
 
 ## Power Requirements
 
 | Rail | Used by |
 |---|---|
-| 5V | LCD backlight, MQ-137 ammonia sensor heater, servo, fan |
-| 3.3V | ESP32 logic, analog sensor signal reference |
-| GND | Common ground — **every component below must share this ground with the ESP32**, even ones powered from 5V |
+| 5V | LCD backlight, MQ-137 heater, feeder servo, both L298N logic rails |
+| 7–12V | L298N motor supply (cooling fan + DC rotator) |
+| 3.3V | ESP32 logic, DS18B20, analog sensor reference |
+| GND | Common ground — **every component must share ground with the ESP32**, including anything on 5V or the motor supply |
 
-A shared, solid ground connection across every component is the single most common cause of "sensor not connected" symptoms when the wiring otherwise looks correct — worth double-checking first if multiple sensors fail at once.
+A shared, solid ground across every component is the single most common cause of "sensor not connected" symptoms when the wiring otherwise looks right. Check it first if several sensors fail at once.
+
+The MG946R-class servo and the MQ-137 heater both draw real current. Do not run them from the ESP32 board's own regulator — give them a separate 5V supply that shares ground.
+
+## Full Pin Map
+
+| GPIO | Function | Notes |
+|---|---|---|
+| 2 | WiFi status LED | HIGH = connected |
+| 16 | DHT11 data | Housing/ambient temperature + humidity |
+| 18 | DS18B20 data | Water temperature |
+| 19 | Feeder servo signal | 50 Hz, 500–2400 µs pulse range |
+| 21 | LCD SDA | I2C |
+| 22 | LCD SCL | I2C |
+| 23 | L298N #2 IN2 | Cooling fan direction |
+| 25 | L298N #1 ENA | DC rotator PWM |
+| 26 | L298N #1 IN1 | Rotator direction |
+| 27 | L298N #1 IN2 | Rotator direction |
+| 32 | pH sensor (analog) | ADC1 |
+| 33 | L298N #2 ENA | Cooling fan PWM |
+| 34 | Turbidity sensor (analog) | ADC1, input-only |
+| 35 | MQ-137 ammonia (analog, via divider) | ADC1, input-only |
+| 17 | L298N #2 IN1 | Cooling fan direction |
+
+Every analog sensor is on **ADC1**, which is the part that keeps working while WiFi is active. ADC2 pins cannot be read at all with WiFi up — that is why none are used here.
+
+## DHT11 — Housing Temperature + Humidity
+
+| Wire | ESP32 Pin |
+|---|---|
+| Data | GPIO 16 |
+| VCC | 3.3V (or 5V — both work) |
+| GND | GND |
+
+- A 10kΩ pull-up between data and VCC is recommended; most breakout modules already have one fitted.
+- The DHT11 **drops individual reads routinely** — this is normal for the part. The firmware keeps the last good value for `SENSOR_GRACE_MS` (15 s) before declaring the sensor disconnected, so a single dropped read neither blanks the app nor cuts the cooling fan.
+- This sensor is what drives the cooling fan. If it is genuinely unplugged, the fan is held OFF rather than guessing a temperature.
+
+## DS18B20 — Water Temperature
+
+| Wire | ESP32 Pin |
+|---|---|
+| Data | GPIO 18 |
+| VCC | 3.3V |
+| GND | GND |
+
+- **A 4.7kΩ pull-up between data and 3.3V is required.** Without it the bus can look like it works intermittently or report zero devices — the most common DS18B20 wiring mistake.
+- Only **one** probe is on this bus in this build; the firmware reads index 0.
+- Resolution is set to 11 bits (0.125 °C steps, ~375 ms conversion). The value is displayed to 0.1 °C, so nothing useful is lost and the sensor pass stays quick.
+
+## Turbidity Sensor (SEN0189)
+
+| Wire | ESP32 Pin |
+|---|---|
+| Signal (analog out) | GPIO 34 |
+| VCC | 5V |
+| GND | GND |
+
+- **No voltage divider** on this input — the board's output already sits inside the ADC range at the calibrated operating point.
+- Calibration (in the firmware): `V_CLEAR = 1.3646 V` → 0 % relative turbidity, `V_HIGH = 1.1916 V` → 100 %. Note the inversion: **more turbid means a LOWER voltage.**
+- Status bands, as voltages and as the percentages the app receives:
+
+  | Status | Voltage | Percent |
+  |---|---|---|
+  | Clear | ≥ 1.33015 V | 0 – 19.9 % |
+  | Slightly Turbid | ≥ 1.28065 V | 19.9 – 48.5 % |
+  | Turbid | ≥ 1.22865 V | 48.5 – 78.6 % |
+  | Highly Turbid | < 1.22865 V | 78.6 – 100 % |
 
 ## pH Sensor
 
 | Wire | ESP32 Pin |
 |---|---|
-| Signal (analog out) | GPIO 35 |
+| Signal (analog out) | GPIO 32 |
 | VCC | 5V (most analog pH boards regulate down internally) |
 | GND | GND |
 
-- GPIO 35 is an **ADC1, input-only** pin — correct for an analog read, but it cannot be repurposed as a digital output if you ever change the wiring.
-- Expected voltage range for a connected, powered probe: roughly **0.05V–3.25V**. A reading stuck at 0.00V or exactly at 3.30V almost always means power or signal wiring, not a calibration issue.
-- Calibration constants (`PH_VOLTAGE_AT_7`, `PH_VOLTS_PER_UNIT`) assume the probe has been calibrated in pH 7.0 buffer solution — do this before trusting absolute readings.
+- The signal passes through a **2:1 divider** (`PH_DIVIDER_RATIO = 2.0`), so the firmware doubles the measured ADC voltage to reconstruct the board's output.
+- Expected ADC voltage for a connected, powered probe: roughly **0.05 V – 3.25 V**. Stuck at 0.00 V or pinned at 3.30 V is a power/signal wiring fault, not a calibration issue — the firmware reports exactly that range as `ph_valid`.
+- Calibration is **3-point** and lives in the firmware as the voltages measured in each buffer:
+
+  | Buffer | Constant | Current value |
+  |---|---|---|
+  | 6.86 | `voltage_pH7` | 1.950 V |
+  | 4.01 | `voltage_pH4` | 2.447 V |
+  | 9.18 | `voltage_pH9` | 1.425 V |
+
+  Recalibrate by reading `pH Voltage` from the serial monitor in each buffer and replacing these three numbers.
 
 ## Ammonia Sensor (MQ-137)
 
 | Wire | ESP32 Pin |
 |---|---|
-| Signal (AOUT) | GPIO 39 |
+| Signal (AOUT) via divider | GPIO 35 |
 | VCC (heater) | 5V |
 | GND | GND |
 
-- GPIO 39 is also ADC1, input-only.
-- **MQ-series sensors need a genuine warm-up period** — the firmware enforces a 60-second warmup (`AMMONIA_WARMUP_MS`) before trusting a reading, and the sensor itself needs its internal heater to reach operating temperature. This is normal, not a fault.
-- The heater draws more current than most other components on this board — if your 5V supply is shared and marginal, this is worth checking with a multimeter under load.
+Wire the divider exactly like this — the MQ-137 can swing above 3.3 V and would otherwise damage the input:
 
-## Water Temperature + Housing Temperature (DS18B20 × 2)
+```
+MQ-137 AO ──[10k]──┬──[10k]── GND
+                   │
+                 GPIO 35
+```
 
-| Wire | ESP32 Pin |
-|---|---|
-| Data (shared bus, both probes) | GPIO 4 |
-| VCC (both probes) | 3.3V |
-| GND (both probes) | GND |
+GPIO 35 therefore sees **half** the MQ-137 output; the firmware multiplies by `AMMONIA_DIVIDER_RATIO = 2.0` to recover it.
 
-- **Both probes share the same single data wire** (OneWire bus) — this is intentional, not a wiring mistake.
-- **A 4.7kΩ pull-up resistor between the data wire and 3.3V is required** for reliable OneWire communication. Without it, the bus can appear to work intermittently or report zero devices — this is the single most common DS18B20 wiring mistake.
-- The firmware distinguishes "water" vs "housing" by which probe is discovered first/second on the bus at boot, then locks onto each probe's unique ROM address for the rest of that power cycle. There's no way to guarantee which physical probe becomes "water" vs "housing" from a cold boot without either checking the diagnostic sketch's printed ROM addresses once and physically labeling each probe, or comparing which one reads a plausible water temperature at first boot.
+- **MQ-series sensors need a genuine warm-up.** Give the heater ~60 s from power-on before trusting a reading. This is the part, not a fault.
+- The heater is the heaviest continuous load on the 5V rail. If 5V is shared and marginal, check it with a multimeter under load.
+- The mg/L estimate is interpolated between three Sera reference points measured on the bench:
+
+  | Sensor voltage | Concentration |
+  |---|---|
+  | 0.2655 V | 0.00 mg/L |
+  | 0.4030 V | 0.17 mg/L |
+  | 0.4400 V | 0.53 mg/L |
+
+  Outside that band the firmware **clamps to the nearest calibrated end** and marks the value `[est]` on the serial monitor. It deliberately does not extrapolate a concentration it has never been calibrated against. Treat this as a relative indicator ("is ammonia rising?"), not a lab figure.
 
 ## LCD Display (16×2, I2C backpack)
 
@@ -57,69 +143,111 @@ A shared, solid ground connection across every component is the single most comm
 | VCC | 5V |
 | GND | GND |
 
-- I2C address is configured as `0x27` — the other common address for these backpacks is `0x3F`. If the diagnostic sketch reports no I2C ACK, try `0x3F` before assuming a wiring fault.
-- If the LCD shows garbled or shifted characters despite a successful I2C ACK, the panel itself (not the wiring or code) is the likely fault.
+- Address is `0x27` in the firmware. The other common address for these backpacks is `0x3F` — try that before assuming a wiring fault if there is no I2C ACK.
+- Garbled or shifted characters despite a good ACK points at the panel itself, not the wiring or code.
+- The display cycles five pages every 2.5 s: water temp + pH, housing temp + humidity, turbidity, ammonia, then both motors.
 
-## Status LEDs + Piezo Buzzer
-
-| Component | ESP32 Pin |
-|---|---|
-| Red LED | GPIO 17 |
-| Yellow LED | GPIO 5 |
-| Green LED | GPIO 23 |
-| Piezo buzzer | GPIO 16 (PWM, 2kHz) |
-
-Each LED is driven directly from its GPIO through a current-limiting resistor (typically 220Ω–330Ω) to GND — no transistor needed at these current levels.
-
-## Cooling Fan
+## Feeder Servo
 
 | Wire | ESP32 Pin |
 |---|---|
-| PWM control signal | GPIO 32 |
-
-- Driven via `ledcAttach`/`ledcWrite` PWM at 25kHz, 8-bit resolution — this is a **direct PWM signal to a MOSFET or transistor switching the fan**, not through the L298N motor driver pins listed below.
-- On boot, the fan briefly kick-starts at a higher duty cycle before settling to a 20% baseline — this is intentional (many small DC fans won't reliably start spinning from a low PWM duty alone).
-
-## Feeding Servo
-
-| Wire | ESP32 Pin |
-|---|---|
-| Signal | GPIO 33 |
-| VCC | 5V (servos draw significant current — do not power from the ESP32's own 3.3V/5V regulator if it's a small hobby servo; use a separate 5V supply sharing common ground) |
+| Signal | GPIO 19 |
+| VCC | 5V (separate supply, shared ground) |
 | GND | GND |
 
-## ⚠️ Defined But Currently Unused
+- `180° = CLOSED / resting`, `160° = OPEN / feeding`. The first pulse the servo ever receives commands 180°, so it settles closed instead of sweeping from 0 at power-on.
+- The firmware reserves LEDC timer 0 for the servo **before** setting up the two `analogWrite()` motors, so the motors cannot take the timer the servo needs. Keep that ordering if you edit `setup()`.
+- Dose is set by how long the door stays open:
 
-These pins are still declared in the firmware (`PIN_L298N_IN1` = GPIO 26, `PIN_L298N_IN2` = GPIO 27, `PIN_L298N_ENA` = GPIO 25) but **no code anywhere references them** — they're leftover from an earlier hardware revision that used an L298N motor driver for a component since removed from the system (matching this project's move away from a filtration/pump subsystem earlier in development).
+  | Grams | Open time |
+  |---|---|
+  | 5 | 400 ms |
+  | 10 | 800 ms |
+  | 15 | 1200 ms |
+  | 20 | 1600 ms |
+  | 25 | 2000 ms |
+  | 30 | 2400 ms |
 
-**If you have an L298N board wired to these pins expecting it to do something, it currently won't** — nothing in the firmware drives them. If you don't have anything wired there, no action needed; they're harmless dead definitions.
+## L298N #1 — DC Rotator
 
-## Quick Reference — Full Pin Map
-
-| GPIO | Function |
+| L298N Pin | ESP32 Pin |
 |---|---|
-| 4 | DS18B20 data (water + housing temp, shared bus) |
-| 5 | Yellow LED |
-| 16 | Piezo buzzer (PWM) |
-| 17 | Red LED |
-| 21 | LCD SDA |
-| 22 | LCD SCL |
-| 23 | Green LED |
-| 25 | *(unused — legacy L298N ENA)* |
-| 26 | *(unused — legacy L298N IN1)* |
-| 27 | *(unused — legacy L298N IN2)* |
-| 32 | Fan PWM control |
-| 33 | Feeding servo signal |
-| 34 | Turbidity sensor (analog) |
-| 35 | pH sensor (analog) |
-| 39 | Ammonia sensor (analog) |
+| ENA | GPIO 25 |
+| IN1 | GPIO 26 |
+| IN2 | GPIO 27 |
+| VCC (motor supply) | 7–12V |
+| GND | **shared with ESP32 GND** |
+
+Direction is fixed in `setup()` (IN1 LOW, IN2 HIGH) and speed comes from PWM on ENA. The rotator runs **only after a feed**: the servo closes, the firmware waits `FEED_SETTLE_MS` (1.5 s) for the feed to drop, then spins the rotator at full speed for `ROTATOR_RUN_MS` (2.0 s).
+
+If the rotator spins the wrong way, swap IN1/IN2 — either the wires or the two `digitalWrite()` calls in `setup()`.
+
+## L298N #2 — Cooling Fan
+
+| L298N Pin | ESP32 Pin |
+|---|---|
+| ENA | GPIO 33 |
+| IN1 | GPIO 17 |
+| IN2 | GPIO 23 |
+| VCC (motor supply) | 7–12V |
+| GND | **shared with ESP32 GND** |
+
+Fully automatic, driven by the DHT11 housing temperature:
+
+| Housing temp | Fan PWM |
+|---|---|
+| below 25 °C | 0 (off) |
+| 25 → 40 °C | ramps 191 → 255 |
+| above 40 °C | 255 (full) |
+
+191 is the lowest duty that reliably starts this fan under load, which is why the ramp begins there rather than at 0. The mobile app shows the same curve — `computeFanSpeed()` in `lib/core/fan_speed_util.dart` mirrors these four numbers, so change them in both places.
+
+## WiFi Status LED
+
+| Wire | ESP32 Pin |
+|---|---|
+| LED anode (through 220–330Ω) | GPIO 2 |
+| LED cathode | GND |
+
+Solid on = associated with the router. Off = disconnected; the firmware retries every 10 s.
+
+## WiFi Credentials
+
+The SSID and password are **not** in `crx_pulse.ino`. The sketch reads them from `secrets.h`, which is gitignored:
+
+```cpp
+#include "secrets.h"
+
+const char* ssid     = WIFI_SSID;
+const char* password = WIFI_PASSWORD;
+```
+
+Two ways to set them:
+
+- **Desktop app** (`desktop/`) — type the network, press Compile & Upload. It writes `secrets.h` and flashes the board. See `desktop/README.md`.
+- **By hand** — `cp secrets.h.example secrets.h` and fill it in.
+
+The sketch will not compile without one of these; a missing `secrets.h` is a "No such file or directory" error, not a silent fallback.
+
+**2.4 GHz only.** The ESP32 cannot join a 5 GHz network, and that failure is indistinguishable from a wrong password — check the band first when it will not connect.
+
+## Serial Bench Keys (115200 baud)
+
+The real control path is the mobile app via Supabase. These exist for bench testing:
+
+| Key | Action |
+|---|---|
+| `7` `8` `9` `a` `b` `c` | Feed 5 / 10 / 15 / 20 / 25 / 30 g (full cycle, including the rotator) |
+| `2` `3` `4` `5` `6` | Rotator motor OFF / 25% / 50% / 75% / 100% |
+
+The cooling fan has no manual key — it is temperature-driven only.
 
 ## If Multiple Sensors Fail Simultaneously
 
-Per the diagnostic conversation that led to this document: pH, Ammonia, Water Temp, and Housing Temp all failing at once is unusual, since they sit on two electrically independent subsystems (analog ADC vs. OneWire digital). The most likely shared cause is:
+pH, ammonia, turbidity and water temperature sit on two electrically independent subsystems (analog ADC vs OneWire digital), so all of them failing together points at something shared:
 
-1. **Missing or loose shared ground** between the sensor rail and the ESP32
-2. **The 4.7kΩ OneWire pull-up resistor missing** (kills both DS18B20 probes at once, but shouldn't affect pH/Ammonia — check this and the ground separately)
-3. **Sensor supply rail not actually powered** (check with a multimeter — a rail that reads 0V or an unstable/sagging voltage under load will cause exactly this symptom across every sensor on that rail)
+1. **Missing or loose shared ground** between the sensor rail and the ESP32.
+2. **Sensor supply rail not actually powered** — check with a multimeter *under load*; a rail that sags when the servo moves or the MQ-137 heater warms up causes exactly this.
+3. **The 4.7kΩ OneWire pull-up missing** — this kills the DS18B20 only, so if pH and ammonia are also dead, look at 1 and 2 first.
 
-Flash the diagnostic sketch and check the raw voltage/ROM-address output before reflashing the main firmware — it'll tell you definitively which of these is the case.
+The serial monitor prints raw ADC counts and voltages alongside every reading. That tells you immediately whether a sensor is pinned at a rail (wiring) or reading a plausible voltage that converts badly (calibration).
