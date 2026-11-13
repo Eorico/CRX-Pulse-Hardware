@@ -9,3 +9,5 @@ build/
 *.bin
 *.elf
 *.map
+config.bat
+node_modules
