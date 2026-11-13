@@ -103,28 +103,104 @@ const unsigned long SERVO_30_GRAMS = 2400;
 // TURBIDITY CALIBRATION
 // =====================================================
 
-const float V_CLEAR = 1.3646;   // 0.00% relative turbidity
-const float V_HIGH  = 1.1916;   // 100.00% relative turbidity
+// Calibration curve, revised 2026-11-08.
+//
+// Two anchors, measured against the tank rather than bench samples:
+//
+//   1.770 V ->   0 %   clear water
+//   1.724 V -> 100 %   fully turbid
+//
+// The whole scale inside 46 mV. This supersedes the earlier five-level
+// bench set (1.812 V down to 0.967 V), which put clear tank water at
+// ~41 % "Slightly Turbid" and badly turbid water at ~53 % "Turbid" --
+// neither matching what the water looked like.
+//
+// So: at or above 1.770 V reads 0 % Clear (which now takes in the old
+// "Slightly" 1.796 V and "Moderate" 1.774 V samples), and at or below
+// 1.724 V reads 100 % Highly Turbid (taking in the old "Turbid"
+// 1.681 V as well as "Highly Turbid" 0.967 V).
+//
+// Still a table so a re-measured intermediate level is a row here, not
+// a formula change. With two rows it is a straight line, which is all
+// 46 mV of range can honestly support.
+const int   TURBIDITY_POINTS = 2;
+const float TURBIDITY_V[TURBIDITY_POINTS]   = { 1.770, 1.724 };
+const float TURBIDITY_PCT[TURBIDITY_POINTS] = { 0.0,   100.0 };
 
-const float TURBIDITY_T1 = 1.33015;  // Clear -> Slightly Turbid
-const float TURBIDITY_T2 = 1.28065;  // Slightly Turbid -> Turbid
-const float TURBIDITY_T3 = 1.22865;  // Turbid -> Highly Turbid
+const float V_CLEAR = 1.770;   //   0.00% relative turbidity
+const float V_HIGH  = 1.724;   // 100.00% relative turbidity
+
+// The standard bands, as PERCENT. The status is decided from the
+// percentage the curve produces, so the band and the published number
+// cannot disagree. "Clear: 0 -< 19.94%", so 19.94 is already Slightly.
+const float TURBIDITY_CLEAR_MAX    = 19.94;
+const float TURBIDITY_SLIGHTLY_MAX = 48.53;
+const float TURBIDITY_TURBID_MAX   = 78.58;
+
+// Relative turbidity % for a pin voltage, interpolated along the table.
+float turbidityPercentOf(float volts) {
+  if (volts >= TURBIDITY_V[0])                    return 0.0;
+  if (volts <= TURBIDITY_V[TURBIDITY_POINTS - 1]) return 100.0;
+  for (int i = 0; i < TURBIDITY_POINTS - 1; i++) {
+    const float vHi = TURBIDITY_V[i];
+    const float vLo = TURBIDITY_V[i + 1];
+    if (volts <= vHi && volts >= vLo) {
+      return TURBIDITY_PCT[i] +
+             (vHi - volts) * (TURBIDITY_PCT[i + 1] - TURBIDITY_PCT[i]) / (vHi - vLo);
+    }
+  }
+  return 100.0;
+}
+
+String turbidityStatusOf(float percent) {
+  if (percent <  TURBIDITY_CLEAR_MAX)    return "Clear";
+  if (percent <= TURBIDITY_SLIGHTLY_MAX) return "Slightly Turbid";
+  if (percent <= TURBIDITY_TURBID_MAX)   return "Turbid";
+  return "Highly Turbid";
+}
 
 
 // =====================================================
 // pH CALIBRATION
 // =====================================================
 
-// float voltage_pH7 = 1.501;
-// float voltage_pH4 = 2.170;
-// float voltage_pH9 = 1.042;   
+// 3-point calibration, measured 2026-11-06.
+//
+// The buffer pH values are constants now, not literals inside the
+// formula. That was the real error: the formula anchored the curve at
+// pH 7.00 and 4.00, but the buffers actually used are 6.78 and 4.05,
+// so readings came out about a full unit high at neutral.
+//
+// Probe voltages are outlier-trimmed means of ten reads per buffer
+// (dropped: 2.295 V from the acid set, 1.401 V from the base set), and
+// are the RECONSTRUCTED probe output, i.e. after PH_DIVIDER_RATIO.
+const float PH_NEUTRAL = 6.78;
+const float PH_ACID    = 4.05;
 
-// NEW — example, use YOUR readings
-float voltage_pH7 = 1.950;   // whatever you got at 6.86
-float voltage_pH4 = 2.447;   // whatever you got at 4.01
-float voltage_pH9 = 1.425;   // whatever you got at 9.18
+// The base buffer's standard is a range, 9.18 - 9.23 (it shifts with
+// temperature). Anchoring at 9.18 puts the measured mean inside it.
+const float PH_BASE    = 9.18;
+
+float voltage_pH_neutral = 1.7567;   // 6.78 buffer
+float voltage_pH_acid    = 2.3891;   // 4.05 buffer
+float voltage_pH_base    = 1.2754;   // 9.18 buffer
 
 const float PH_DIVIDER_RATIO = 2.0;
+
+// Two segments, not one line: the electrode is 231.7 mV per pH on the
+// acid side against 200.5 mV per pH on the base side, a 16% asymmetry.
+// A single straight fit would miss the outer buffers by about 0.2 pH.
+float phValueOf(float probeVolts) {
+  float value;
+  if (probeVolts >= voltage_pH_neutral) {
+    value = PH_NEUTRAL + (probeVolts - voltage_pH_neutral) *
+            (PH_ACID - PH_NEUTRAL) / (voltage_pH_acid - voltage_pH_neutral);
+  } else {
+    value = PH_NEUTRAL + (probeVolts - voltage_pH_neutral) *
+            (PH_BASE - PH_NEUTRAL) / (voltage_pH_base - voltage_pH_neutral);
+  }
+  return constrain(value, 0.0, 14.0);
+}
 
 
 // =====================================================
@@ -157,6 +233,8 @@ float ammoniaSensorVoltage = 0.0;
 
 float ammoniaEstimatedMgL = 0.0;
 bool ammoniaInCalibrationRange = false;
+bool ammoniaBelowRange = false;   // reading bottomed out below V0
+bool ammoniaAboveRange = false;   // reading past V2, mg/L held at C2
 
 // Turbidity raw values, promoted to globals so
 // printSensorData() can display them beside clarity.
@@ -383,30 +461,13 @@ void readSensors() {
   turbidityADCVoltage =
     (turbidityADC / 4095.0) * 3.3;
 
-  // NEW
+  // Piecewise curve, then the band from the PERCENTAGE -- so the
+  // status and the number can never disagree.
   relativeTurbidity =
-    ((V_CLEAR - turbidityADCVoltage) /
-     (V_CLEAR - V_HIGH)) * 100.0;
+    turbidityPercentOf(turbidityADCVoltage);
 
-  relativeTurbidity =
-    constrain(
-      relativeTurbidity,
-      0.0,
-      100.0
-    );
-
-  if (turbidityADCVoltage >= TURBIDITY_T1) {
-    turbidityStatus = "Clear";
-  }
-  else if (turbidityADCVoltage >= TURBIDITY_T2) {
-    turbidityStatus = "Slightly Turbid";
-  }
-  else if (turbidityADCVoltage >= TURBIDITY_T3) {
-    turbidityStatus = "Turbid";
-  }
-  else {
-    turbidityStatus = "Highly Turbid";
-  }
+  turbidityStatus =
+    turbidityStatusOf(relativeTurbidity);
 
   // ---------------------------------------------------
   // pH
@@ -423,30 +484,8 @@ void readSensors() {
     PH_DIVIDER_RATIO;
 
 
-  if (phVoltage >= voltage_pH7) {
-
-    pH =
-      7.0 +
-      (phVoltage - voltage_pH7) *
-      (4.0 - 7.0) /
-      (voltage_pH4 - voltage_pH7);
-  }
-
-  else {
-
-    pH =
-      7.0 +
-      (phVoltage - voltage_pH7) *
-      (9.18 - 7.0) /
-      (voltage_pH9 - voltage_pH7);
-  }
-
   pH =
-    constrain(
-      pH,
-      0.0,
-      14.0
-    );
+    phValueOf(phVoltage);
 
 
   // ---------------------------------------------------
@@ -479,26 +518,43 @@ void readSensors() {
   const float C1 = 0.17;
   const float C2 = 0.53;
 
-  ammoniaInCalibrationRange = false;
-  ammoniaEstimatedMgL = 0.0;
+  // Outside the calibrated span the reading is 0.00, at BOTH ends.
+  //
+  //   below V0 -> 0.00: the honest floor.
+  //   above V2 -> 0.00 too. This used to hold at C2 (0.53), on the
+  //     reasoning that past the top reference the true concentration
+  //     must be higher still. That only holds while the calibration
+  //     fits the sensor, and on this unit it does not: with nothing to
+  //     detect it sits near 0.629 V, ~0.19 V above the top reference,
+  //     so the tank read "0.53 Critical" permanently.
+  //
+  // Cost: while out of band, a genuinely high level also reads 0.00.
+  // Only recalibration fixes that; the voltage below is the one
+  // trustworthy figure in this state.
+  ammoniaInCalibrationRange =
+      (ammoniaSensorVoltage >= V0 && ammoniaSensorVoltage <= V2);
 
-  if (ammoniaSensorVoltage >= V0 && 
-      ammoniaSensorVoltage <= V2) {
+  ammoniaBelowRange = (ammoniaSensorVoltage <  V0);
+  ammoniaAboveRange = (ammoniaSensorVoltage >  V2);
 
-    ammoniaInCalibrationRange = true;
-
-    if (ammoniaSensorVoltage <= V1) {
-      ammoniaEstimatedMgL = 
-          C0 + 
-          (ammoniaSensorVoltage - V0) *
-          (C1 - C0) / (V1 - V0);
-    }
-    else {
-      ammoniaEstimatedMgL =
-          C1 + 
-          (ammoniaSensorVoltage - V1) *
-          (C2 - C1) / (V2 - V1);
-    }
+  if (ammoniaSensorVoltage <= V0) {
+    ammoniaEstimatedMgL = C0;
+  }
+  else if (ammoniaSensorVoltage >  V2) {
+    // strictly above, so V2 itself still yields C2 as calibrated
+    ammoniaEstimatedMgL = C0;
+  }
+  else if (ammoniaSensorVoltage <= V1) {
+    ammoniaEstimatedMgL =
+        C0 +
+        (ammoniaSensorVoltage - V0) *
+        (C1 - C0) / (V1 - V0);
+  }
+  else {
+    ammoniaEstimatedMgL =
+        C1 +
+        (ammoniaSensorVoltage - V1) *
+        (C2 - C1) / (V2 - V1);
   }
 }
 
@@ -910,12 +966,24 @@ void printSensorData() {
   // Estimated concentration block.
   Serial.println("Estimated ammonia concentration");
 
-  if (ammoniaInCalibrationRange) {
-    Serial.print(ammoniaEstimatedMgL, 2);
-    Serial.println(" mg/L");
+  Serial.print(ammoniaEstimatedMgL, 2);
+  Serial.print(" mg/L   (");
+  Serial.print(ammoniaSensorVoltage, 3);
+  Serial.println(" V)");
+
+  if (ammoniaBelowRange) {
+    Serial.print("  at floor: ");
+    Serial.print(ammoniaSensorVoltage, 3);
+    Serial.print(" V is below the ");
+    Serial.print(0.2655, 3);
+    Serial.println(" V zero reference");
   }
-  else {
-    Serial.println("-- mg/L (out of range)");
+  else if (ammoniaAboveRange) {
+    Serial.print("  OUT OF BAND (high): ");
+    Serial.print(ammoniaSensorVoltage, 3);
+    Serial.print(" V is past the ");
+    Serial.print(0.4400, 3);
+    Serial.println(" V top reference - forced to 0.00, NOT proof of clean water");
   }
 
   Serial.println("NH4/NH3 estimate");
@@ -924,12 +992,8 @@ void printSensorData() {
 
   Serial.println("Status");
 
-  if (ammoniaInCalibrationRange) {
-    Serial.println(getAmmoniaStatus(ammoniaEstimatedMgL));
-  }
-  else {
-    Serial.println("Unknown");
-  }
+  // Always a status now, from the clamped figure.
+  Serial.println(getAmmoniaStatus(ammoniaEstimatedMgL));
 
 
   // ---------------------------------------------------

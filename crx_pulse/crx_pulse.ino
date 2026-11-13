@@ -32,7 +32,7 @@
  *      single failed read (very common on a DHT11) is invisible — it
  *      keeps showing the last good value. This firmware now does the
  *      same via a GRACE WINDOW: a sensor stays "valid" for
- *      SENSOR_GRACE_MS after its last good read. Before, one dropped
+ *      SensorValidity::GRACE_MS after its last good read. Before, one dropped
  *      read flipped ambient_valid=false, which blanked Housing
  *      Temperature in the app AND cut the cooling fan mid-ramp.
  *
@@ -103,11 +103,11 @@
  *
  *  FEEDING (servo) + DELAY-ROTATION (DC rotator motor):
  *     On every feed (manual command OR schedule):
- *       1. Servo opens to SERVO_OPEN_ANGLE (160 deg).
+ *       1. Servo opens to ServoConfig::OPEN_ANGLE (160 deg).
  *       2. Held open for the gram-calibrated time (5g=400ms ... 30g=2400ms).
- *       3. Servo returns to SERVO_CLOSED_ANGLE (180 deg).
- *       4. Wait FEED_SETTLE_MS (1.5 s) for the feed to drop.
- *       5. Run the DC rotator (Motor 1) for ROTATOR_RUN_MS (12 s) at the
+ *       3. Servo returns to ServoConfig::CLOSED_ANGLE (180 deg).
+ *       4. Wait FeedController::SETTLE_MS (1.5 s) for the feed to drop.
+ *       5. Run the DC rotator (Motor 1) for FeedController::ROTATOR_RUN_MS (12 s) at the
  *          speed the command/schedule asked for, then stop. The app
  *          offers the five PWM levels the bench sketch tested
  *          (0/90/128/191/255); 0 skips the rotation entirely.
@@ -115,8 +115,8 @@
  *  TEST COMPONENTS (app Settings tab):
  *     servo_open / servo_close / motor_test drive the actuators
  *     directly. Both are bounded by the firmware, not by the app:
- *     a test-opened door force-closes after SERVO_TEST_MAX_OPEN_MS
- *     (10 s) and a test-driven motor stops after MOTOR_TEST_MAX_MS
+ *     a test-opened door force-closes after ComponentSafetyTestTimers::SERVO_MAX_OPEN_MS
+ *     (10 s) and a test-driven motor stops after ComponentSafetyTestTimers::MOTOR_MAX_MS
  *     (30 s). An open feeder door keeps dropping feed, and neither
  *     actuator should keep running because somebody closed the app.
  *
@@ -187,12 +187,6 @@ const unsigned long WIFI_RETRY_INTERVAL = 10000;
 // The anon key is safe to embed (it is designed to be public and is
 // bounded by the RLS policies you create in the SQL editor).
 
-#define SUPABASE_URL  "https://qlrjplwxsgklawunuoey.supabase.co"
-#define SUPABASE_KEY  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFscmpwbHd4c2drbGF3dW51b2V5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTE3MDUxMTQsImV4cCI6MjEwNzI4MTExNH0.BWiTxwr6kafN5EuyyEIsQZ0Ikd7QelARsJSMkNyVxh8"
-#define DEVICE_ID     "tank_01"
-
-#define FIRMWARE_VERSION  "13.0.0"
-
 // How often the ESP32 pushes a reading to Supabase, and polls for
 // commands / schedules. These are the CLOUD cadences; the LCD and the
 // local serial print update on their own faster timers below.
@@ -200,7 +194,15 @@ const unsigned long WIFI_RETRY_INTERVAL = 10000;
 // The app treats a reading as live for 3x CLOUD_READING_INTERVAL (see
 // _freshWindow in lib/core/firmware_spec.dart) — change one and change
 // the other.
-const unsigned long CLOUD_READING_INTERVAL  = 10000;  // push reading every 10 s
+// Publish every 3 s. Sensors are sampled every LocalSensorTiming::READ_INTERVAL_MS (2 s),
+// so this keeps the app within about one sample of the LCD instead of
+// the ~10 s it trailed by before.
+//
+// Only affordable because cloudRequest() reuses one TLS connection —
+// at the old one-handshake-per-request cost, 3 s would have meant the
+// device spending nearly all its time handshaking. See the shared TLS
+// connection section above.
+const unsigned long CLOUD_READING_INTERVAL  = 3000;   // push reading every 3 s
 const unsigned long CLOUD_COMMAND_INTERVAL  =  5000;  // poll commands every 5 s
 const unsigned long CLOUD_SCHEDULE_INTERVAL = 60000;  // refresh schedules every 60 s
 
@@ -224,7 +226,7 @@ unsigned long lastCloudSchedule = 0;
 //   always mirrored. They are rare, and they are the ones worth having
 //   history for when you open the console later.
 //
-//   VERBOSE lines (the sensor block, printed every SENSOR_INTERVAL) are
+//   VERBOSE lines (the sensor block, printed every LocalSensorTiming::READ_INTERVAL_MS) are
 //   mirrored only while the app has asked for them with a `log_stream`
 //   command. The console sends that on open and renews it while it
 //   stays open, so verbose output stops by itself a few minutes after
@@ -325,7 +327,21 @@ DHT dht(DHT_PIN, DHT_TYPE);
 OneWire oneWire(WATER_TEMP_PIN);
 DallasTemperature waterTempSensor(&oneWire);
 
-LiquidCrystal_I2C lcd(0x27, 16, 2);
+// =====================================================
+// LCD
+// =====================================================
+class LCDConfig {
+ public:
+  static const int I2C_ADDRESS = 0x27;
+  static const int COLS = 16;
+  static const int ROWS = 2;
+
+  // Water/pH, housing/humidity, turbidity, ammonia, feed state.
+  static const int PAGE_COUNT = 5;
+
+  static const unsigned long UPDATE_INTERVAL_MS = 2500;
+};
+LiquidCrystal_I2C lcd(LCDConfig::I2C_ADDRESS, LCDConfig::COLS, LCDConfig::ROWS);
 
 Servo myServo;
 
@@ -346,27 +362,43 @@ Servo myServo;
 //       25       |   2000
 //       30       |   2400
 
-const int SERVO_OPEN_ANGLE   = 160;
-const int SERVO_CLOSED_ANGLE = 180;
+class ServoConfig {
+ public:
+  // The names lose their "SERVO_" prefix: inside ServoConfig it only
+  // repeated what the scope already says.
+  static const int OPEN_ANGLE   = 160;
+  static const int CLOSED_ANGLE = 180;
 
-unsigned long gramsToOpenMs(int grams) {
-  switch (grams) {
-    case 5:  return 400;
-    case 10: return 800;
-    case 15: return 1200;
-    case 20: return 1600;
-    case 25: return 2000;
-    case 30: return 2400;
-    default: return 800;   // safe fallback ~10 g
+  // Grams -> how long the door stays open. Was a free function; it is
+  // servo policy, so it belongs with the angles it opens to.
+  static unsigned long openMsForGrams(int grams) {
+    switch (grams) {
+      case 5:  return 400;
+      case 10: return 800;
+      case 15: return 1200;
+      case 20: return 1600;
+      case 25: return 2000;
+      case 30: return 2400;
+      default: return 800;   // safe fallback ~10 g
+    }
   }
-}
+};
 
-// Delay-rotation of the DC rotator after feed is released.
-const unsigned long FEED_SETTLE_MS = 1500;   // wait 1.5 s after the door closes
 
-// How long the DC rotator spins after each feed. 2 s was not enough to
-// complete a turn; 10-15 s is. Anywhere in that range is fine.
-const unsigned long ROTATOR_RUN_MS = 12000;  // 12 s
+
+// Timings and in-flight state for one feed cycle. The actuator calls
+// stay as free functions (they touch the servo, the motor and the log
+// together); what is gathered here is the policy and the state those
+// functions share, which was previously six loose globals.
+class FeedController {
+ public:
+  // Delay-rotation of the DC rotator after feed is released.
+  static const unsigned long SETTLE_MS = 1500;   // 1.5 s after the door closes
+
+  // How long the DC rotator spins after each feed. 2 s was not enough
+  // to complete a turn; 10-15 s is. Anywhere in that range is fine.
+  static const unsigned long ROTATOR_RUN_MS = 12000;  // 12 s
+};
 
 // NON-BLOCKING, and it has to be at this length. runRotator() used to
 // delay() for the whole spin, which was tolerable at 2 s. At 12 s it
@@ -379,6 +411,34 @@ const unsigned long ROTATOR_RUN_MS = 12000;  // 12 s
 // So the rotation is a deadline serviced from loop() instead.
 // rotatorStopAt == 0 means idle.
 unsigned long rotatorStopAt = 0;
+
+// Making the rotation non-blocking had a side effect on the ADC.
+//
+// crx_pulse_test.ino never samples an analog sensor while the feeder
+// motor is turning — it has no feed routine at all, so motor1 only
+// moves when a serial command drives it, and the sketch is otherwise
+// idle. This sketch spins the rotator for FeedController::ROTATOR_RUN_MS from loop(),
+// and at LocalSensorTiming::READ_INTERVAL_MS = 2 s that meant readSensors() fired about
+// six times mid-spin, with a brushed DC motor loaded on the same
+// supply.
+//
+// A motor's current draw pulls the 3.3 V rail down and couples
+// switching noise into it, and all three analog sensors measure
+// against that rail. Ammonia suffers worst: its whole calibrated band
+// is 0.1745 V wide (AmmoniaConfig::V0 -> AmmoniaConfig::V2), so a dip of a few tens
+// of millivolts is enough to throw a reading clean out of the band.
+// Turbidity is next — TurbidityCalibration::V_CLEAR to TurbidityCalibration::V_HIGH spans just 0.173 V.
+//
+// So the analog reads are held while motor1 is energised, plus a short
+// settle after it stops. The digital sensors (DS18B20, DHT11) are
+// unaffected by rail noise and keep updating throughout, which also
+// keeps them inside SensorValidity::GRACE_MS during a long motor test.
+unsigned long adcBlockedUntil = 0;
+
+// True when the last pass held the analog values instead of sampling.
+// Only so the serial output can say so — otherwise the same turbidity
+// and ammonia lines repeat during a feed and look like a frozen sensor.
+bool analogHeld = false;
 
 // doFeed() is blocking (it uses delay()), so a schedule cannot interrupt
 // a command feed. This flag is belt-and-braces for the same guarantee.
@@ -398,18 +458,38 @@ bool feedInProgress = false;
 // a normal feed, which drives both actuators itself and returns them to
 // rest before it finishes.
 
-const unsigned long SERVO_TEST_MAX_OPEN_MS = 10000;   // 10 s, then close
-const unsigned long MOTOR_TEST_MAX_MS      = 30000;   // 30 s, then stop
+class ComponentSafetyTestTimers {
+ public:
+  static const unsigned long SERVO_MAX_OPEN_MS = 10000;   // 10 s, then close
+  static const unsigned long MOTOR_MAX_MS      = 30000;   // 30 s, then stop
 
-unsigned long servoTestOpenedAt = 0;   // 0 = not opened by a test
-unsigned long motorTestStartedAt = 0;  // 0 = not started by a test
+  // 0 = this actuator was not started by a test.
+  static unsigned long servoOpenedAt;
+  static unsigned long motorStartedAt;
+
+  /// True when [startedAt] is running and has passed [limitMs].
+  ///
+  /// Both deadlines were this same expression written out twice.
+  ///
+  /// The subtraction is deliberately UNSIGNED, exactly as the two call
+  /// sites had it. `now - startedAt >= limitMs` on unsigned longs is
+  /// what the original compared, and a signed cast -- which looks
+  /// tidier -- behaves differently once millis() passes 2^31. Keeping
+  /// the arithmetic identical was the point of the exercise.
+  static bool expired(unsigned long startedAt, unsigned long limitMs,
+                      unsigned long now) {
+    return startedAt != 0 && (now - startedAt >= limitMs);
+  }
+};
+unsigned long ComponentSafetyTestTimers::servoOpenedAt = 0;
+unsigned long ComponentSafetyTestTimers::motorStartedAt = 0;
 
 
 // =====================================================
 // TURBIDITY CALIBRATION  (SEN0189, no divider)
 // =====================================================
 //
-// Relative turbidity % = (V_CLEAR - V) / (V_CLEAR - V_HIGH) * 100
+// Relative turbidity % = (TurbidityCalibration::V_CLEAR - V) / (TurbidityCalibration::V_CLEAR - TurbidityCalibration::V_HIGH) * 100
 //
 // The four status bands below are voltage thresholds. Their PERCENT
 // equivalents (which is what the app receives) are:
@@ -422,12 +502,126 @@ unsigned long motorTestStartedAt = 0;  // 0 = not started by a test
 // The app derives those same numbers from these same constants in
 // lib/core/firmware_spec.dart — keep the two in step.
 
-const float V_CLEAR = 1.3646;   // 0.00% relative turbidity
-const float V_HIGH  = 1.1916;   // 100.00% relative turbidity
+// The ADC conversion itself, which all three analog sensors wrote out
+// identically.
+//
+// toVolts() returns DOUBLE deliberately. The original expression was
+//     (analogChannels[CH_TURBIDITY].raw / 4095.0) * 3.3
+// whose literals are doubles, and the result was then narrowed by the
+// assignment to a float. Rewriting it with 4095.0f / 3.3f would do the
+// arithmetic in float and round differently -- 714 of the 4096
+// possible counts come out with different bits. The caller still
+// stores a float, exactly as before.
+class AdcConfig {
+ public:
+  static const int MAX_COUNT = 4095;
 
-const float TURBIDITY_T1 = 1.33015;  // Clear -> Slightly Turbid
-const float TURBIDITY_T2 = 1.28065;  // Slightly Turbid -> Turbid
-const float TURBIDITY_T3 = 1.22865;  // Turbid -> Highly Turbid
+  // (double)MAX_COUNT is exactly 4095.0 -- an int this small converts
+  // without rounding -- so this stays bit-identical to the literal it
+  // replaces while losing the magic number.
+  static double toVolts(int raw) { return (raw / (double)MAX_COUNT) * 3.3; }
+};
+
+
+class TurbidityCalibration {
+ public:
+  // ---- Calibration curve, revised 2026-11-08 ----
+  //
+  // Two anchors, measured against the tank rather than against bench
+  // samples:
+  //
+  //   1.770 V ->   0 %   clear water
+  //   1.724 V -> 100 %   fully turbid
+  //
+  // That is the whole scale inside 46 mV, which is a much narrower
+  // working range than the earlier five-level bench set implied. It
+  // supersedes that set: those samples spanned 1.812 V down to 0.967 V,
+  // and anchoring on them put clear tank water at ~41 % ("Slightly
+  // Turbid") and badly turbid water at ~53 % ("Turbid"), neither of
+  // which matched what the water actually looked like.
+  //
+  // Consequences worth knowing, since they are not obvious:
+  //   - anything at or above 1.770 V reads 0 % Clear, which now
+  //     includes the old "Slightly Turbid" (1.796 V) and "Moderate"
+  //     (1.774 V) bench samples;
+  //   - anything at or below 1.724 V reads 100 % Highly Turbid, which
+  //     now includes the old "Turbid" bench sample (1.681 V) as well
+  //     as the old "Highly Turbid" one (0.967 V).
+  //
+  // Still a table rather than two constants: re-measuring an
+  // intermediate level later is a row here, not a change to the
+  // formula. With two rows percentOf() is a straight line, which is
+  // all 46 mV of range can honestly support.
+  static const int POINT_COUNT = 2;
+  static const float V_POINTS[POINT_COUNT];    // volts, DESCENDING
+  static const float PCT_POINTS[POINT_COUNT];  // matching percentages
+
+  // Kept as names because the serial diagnostics and the app refer to
+  // the two ends of the curve.
+  static constexpr float V_CLEAR = 1.770;   //   0.00 % relative turbidity
+  static constexpr float V_HIGH  = 1.724;   // 100.00 % relative turbidity
+
+  // ---- The standard relative-turbidity bands ----
+  //
+  // These are now stated directly as PERCENT rather than derived from
+  // voltage thresholds. The status is decided from the percentage the
+  // curve above produces, so the status bands and the published
+  // percentage can no longer disagree -- which they could when one was
+  // computed from volts and the other from percent.
+  //
+  // Clear is BELOW 19.94, not at-or-below: the standard reads
+  // "0 -< 19.94%", so 19.94 itself is already Slightly Turbid.
+  static constexpr float CLEAR_MAX    = 19.94;
+  static constexpr float SLIGHTLY_MAX = 48.53;
+  static constexpr float TURBID_MAX   = 78.58;
+
+  // Outside this ADC band the input is sitting on a rail. See
+  // printSensorData(), which notes which rail. Deliberately just
+  // inside each: a powered sensor never reaches 0.016 V or 3.284 V.
+  static const int ADC_MIN_VALID = 20;    // 0.016 V -- held at ground
+  static const int ADC_MAX_VALID = 4075;  // 3.284 V -- railed high
+
+  /// Relative turbidity % for a pin voltage, by interpolation along
+  /// the table above. Flat at 0 / 100 outside the measured ends.
+  static float percentOf(float volts) {
+    if (volts >= V_POINTS[0])              return 0.0;
+    if (volts <= V_POINTS[POINT_COUNT - 1]) return 100.0;
+
+    for (int i = 0; i < POINT_COUNT - 1; i++) {
+      const float vHi = V_POINTS[i];
+      const float vLo = V_POINTS[i + 1];
+      if (volts <= vHi && volts >= vLo) {
+        return PCT_POINTS[i] +
+               (vHi - volts) * (PCT_POINTS[i + 1] - PCT_POINTS[i]) / (vHi - vLo);
+      }
+    }
+    return 100.0;
+  }
+
+  /// One ladder, used by the serial print and the LCD. Takes the
+  /// PERCENTAGE, so it cannot drift from the published number.
+  static const char* statusOf(float percent) {
+    if (percent <  CLEAR_MAX)    return "Clear";
+    if (percent <= SLIGHTLY_MAX) return "Slightly Turbid";
+    if (percent <= TURBID_MAX)   return "Turbid";
+    return "Highly Turbid";
+  }
+};
+const float TurbidityCalibration::V_POINTS[TurbidityCalibration::POINT_COUNT] =
+    { 1.770, 1.724 };
+const float TurbidityCalibration::PCT_POINTS[TurbidityCalibration::POINT_COUNT] =
+    { 0.0, 100.0 };
+
+// Outside this ADC band the input is sitting on a rail, which is a
+// wiring or power fault rather than a turbidity reading — see the
+// validity check in readSensors(). Deliberately just inside each rail:
+// a powered sensor's output never reaches 0.016 V or 3.284 V, so these
+// catch a fault without ever rejecting a real measurement.
+//
+// NOTE: these bound the plausible range only. They do not touch the
+// calibration above, which is still the OLD sensor's: TurbidityCalibration::V_CLEAR 1.3646 /
+// TurbidityCalibration::V_HIGH 1.1916 leaves just 215 of 4095 counts usable, so a replacement
+// probe will read saturated until those two are measured again.
 
 
 // =====================================================
@@ -435,12 +629,65 @@ const float TURBIDITY_T3 = 1.22865;  // Turbid -> Highly Turbid
 // =====================================================
 //
 // Replace with YOUR measured buffer voltages if you recalibrate.
+class PhCalibration {
+ public:
+  // ---- 3-point calibration, measured 2026-11-06 ----
+  //
+  // The buffer pH values are constants now, not literals baked into
+  // the formula. That was the real error: the formula hard-coded 7.00
+  // and 4.00 as the anchor pH values, but the buffers actually used
+  // are 6.78 and 4.05. So even with the right voltages the curve was
+  // anchored to the wrong pH, and the readings came out high by about
+  // a full unit at neutral.
+  //
+  // Measured probe voltages are the outlier-trimmed means of ten reads
+  // per buffer. Dropped as >2 sd from their group: 2.295 V in the acid
+  // set, 1.401 V in the base set.
+  //
+  //   buffer    true pH   probe volts
+  //   neutral      6.78      1.7567
+  //   acid         4.05      2.3891
+  //   base         9.18      1.2754
+  //
+  // Voltages are the RECONSTRUCTED probe output, i.e. after the pin
+  // reading has been multiplied back up by DIVIDER_RATIO.
+  static constexpr float PH_NEUTRAL = 6.78;
+  static constexpr float PH_ACID    = 4.05;
 
-float voltage_pH7 = 1.950;   // reading at 6.86 buffer
-float voltage_pH4 = 2.447;   // reading at 4.01 buffer
-float voltage_pH9 = 1.425;   // reading at 9.18 buffer
+  // The base buffer's standard is quoted as a range, 9.18 - 9.23
+  // (it shifts with temperature). Anchoring at the bottom of that
+  // range puts the measured mean at 9.18, which is inside it.
+  static constexpr float PH_BASE    = 9.18;
 
-const float PH_DIVIDER_RATIO = 2.0;
+  // Not const: these are what you change when you recalibrate.
+  static float V_NEUTRAL;
+  static float V_ACID;
+  static float V_BASE;
+
+  static constexpr float DIVIDER_RATIO = 2.0;
+
+  /// Two-segment interpolation about the neutral point.
+  ///
+  /// Two segments rather than one line because the electrode's
+  /// sensitivity is not symmetric: 231.7 mV per pH on the acid side
+  /// against 200.5 mV per pH on the base side, a 16% difference. A
+  /// single straight fit through all three buffers would miss the
+  /// outer two by roughly 0.2 pH.
+  static float valueOf(float probeVolts) {
+    float pH;
+    if (probeVolts >= V_NEUTRAL) {
+      pH = PH_NEUTRAL + (probeVolts - V_NEUTRAL) * (PH_ACID - PH_NEUTRAL) /
+                        (V_ACID - V_NEUTRAL);
+    } else {
+      pH = PH_NEUTRAL + (probeVolts - V_NEUTRAL) * (PH_BASE - PH_NEUTRAL) /
+                        (V_BASE - V_NEUTRAL);
+    }
+    return constrain(pH, 0.0, 14.0);
+  }
+};
+float PhCalibration::V_NEUTRAL = 1.7567;   // 6.78 buffer
+float PhCalibration::V_ACID    = 2.3891;   // 4.05 buffer
+float PhCalibration::V_BASE    = 1.2754;   // 9.18 buffer
 
 
 // =====================================================
@@ -454,26 +701,92 @@ const float PH_DIVIDER_RATIO = 2.0;
 // concentrations this sensor has ever been calibrated against, so the
 // estimate is clamped to the span they cover — see readSensors().
 
-const float AMMONIA_DIVIDER_RATIO = 2.0;
+class AmmoniaConfig {
+ public:
+  static constexpr float DIVIDER_RATIO = 2.0;
 
-const float AMMONIA_V0 = 0.2655;   // volts at 0.00 mg/L
-const float AMMONIA_V1 = 0.4030;   // volts at 0.17 mg/L
-const float AMMONIA_V2 = 0.4400;   // volts at 0.53 mg/L
+  static constexpr float V0 = 0.2655;   // volts at 0.00 mg/L
+  static constexpr float V1 = 0.4030;   // volts at 0.17 mg/L
+  static constexpr float V2 = 0.4400;   // volts at 0.53 mg/L
 
-const float AMMONIA_C0 = 0.00;     // mg/L
-const float AMMONIA_C1 = 0.17;
-const float AMMONIA_C2 = 0.53;
+  static constexpr float C0 = 0.00;     // mg/L
+  static constexpr float C1 = 0.17;
+  static constexpr float C2 = 0.53;
 
-int   ammoniaADC = 0;
-float ammoniaADCVoltage = 0.0;
-float ammoniaSensorVoltage = 0.0;
+  /// Is the reconstructed sensor voltage inside the Sera band at all?
+  /// The band test was written out in readSensors(), the serial print
+  /// and the LCD; now there is one of it.
+  static bool inCalibrationRange(float v) { return v >= V0 && v <= V2; }
+
+  /// Below the lowest reference, i.e. the reading has bottomed out.
+  static bool belowRange(float v) { return v < V0; }
+
+  /// Above the highest reference. The mg/L figure then reads 0.00
+  /// because the curve no longer describes this sensor -- it is not a
+  /// measurement, and it is not evidence that the water is clean.
+  static bool aboveRange(float v) { return v > V2; }
+
+  // The two Safe/Warning/Critical thresholds, in the class that owns
+  // the calibration they describe.
+  static constexpr float SAFE_MAX    = 0.25;
+  static constexpr float WARNING_MAX = 0.50;
+
+  /// const char*, not String: each of these returns one of three fixed
+  /// literals, and a String would heap-allocate a copy of a literal
+  /// every time the serial line or the LCD page was built -- several
+  /// times a second, forever.
+  static const char* statusOf(float mgL) {
+    if (mgL < SAFE_MAX)    return "Safe";
+    if (mgL < WARNING_MAX) return "Warning";
+    return "Critical";
+  }
+
+  /// Same bands, abbreviated for the 16-column LCD.
+  static const char* statusShortOf(float mgL) {
+    if (mgL < SAFE_MAX)    return "Safe";
+    if (mgL < WARNING_MAX) return "Warn";
+    return "Crit";
+  }
+
+  /// mg/L by linear interpolation between the two Sera segments.
+  /// ANYTHING outside the calibrated span reads 0.00.
+  ///
+  /// Both ends report C0 (0.00), deliberately:
+  ///
+  ///   below V0 -> 0.00. Nothing the sensor can see; the honest floor.
+  ///
+  ///   above V2 -> 0.00 as well. An earlier version held this at C2
+  ///               (0.53) on the reasoning that past the top reference
+  ///               the true concentration must be higher still. That is
+  ///               sound only while the calibration matches the sensor,
+  ///               and on this unit it does not: with nothing to detect
+  ///               it sits around 0.629 V, nearly 0.19 V ABOVE the top
+  ///               reference. So the ceiling fired constantly and the
+  ///               tank read "0.53 Critical" at all times, which is both
+  ///               wrong and useless as an alarm.
+  ///
+  /// The cost, stated plainly: while the sensor reads outside its band,
+  /// a genuinely high ammonia level ALSO reports 0.00. Nothing in the
+  /// firmware can distinguish the two until the MQ-137 is recalibrated
+  /// against known concentrations. The serial line says when a reading
+  /// is out of band and prints the voltage, which is the only
+  /// trustworthy figure in that state.
+  static float mgLOf(float v) {
+    if (v <= V0) return C0;
+    // STRICTLY above V2, matching aboveRange(). With >= the top
+    // reference point itself returned 0.00, contradicting the
+    // calibration table that defines 0.4400 V as C2.
+    if (v >  V2) return C0;
+    if (v <= V1) return C0 + (v - V0) * (C1 - C0) / (V1 - V0);
+    return C1 + (v - V1) * (C2 - C1) / (V2 - V1);
+  }
+};
+
 
 float ammoniaEstimatedMgL = 0.0;
 bool  ammoniaInCalibrationRange = false;
 
 // Turbidity raw values (globals so the printer / payload can read them).
-int   turbidityADC = 0;
-float turbidityADCVoltage = 0.0;
 
 
 // =====================================================
@@ -486,7 +799,66 @@ float turbidityADCVoltage = 0.0;
 // the app blink "Not Connected" and cut the fan mid-ramp. A sensor now
 // stays valid until it has been failing for this long.
 
-const unsigned long SENSOR_GRACE_MS = 15000;   // 15 s of silence = really gone
+// =====================================================
+// THE THREE ANALOG CHANNELS, AS AN ARRAY
+// =====================================================
+//
+// Turbidity, pH and ammonia are read the same way: analogRead the pin,
+// convert the count to volts, then (pH and ammonia only) multiply back
+// up through the 2:1 divider the probe sits behind. That was three
+// copies of the same four lines.
+//
+// One descriptor per channel, one loop to sample them all. Adding a
+// fourth analog sensor is now a row in this table rather than another
+// copied block.
+//
+// Costs no RAM worth counting: three descriptors of two floats, an int
+// and a const pin -- and it REPLACES the nine loose globals
+// (analogChannels[CH_TURBIDITY].raw/ADCVoltage, analogChannels[CH_PH].raw/PinVoltage/Voltage,
+// analogChannels[CH_AMMONIA].raw/ADCVoltage/SensorVoltage) that it now feeds.
+struct AnalogChannel {
+  const uint8_t pin;
+
+  /// 1.0 for a sensor wired straight to the pin; 2.0 for one behind
+  /// the 10k/10k divider, where the pin sees half the real output.
+  const float dividerRatio;
+
+  int   raw         = 0;   // 0..AdcConfig::MAX_COUNT
+  float pinVolts    = 0.0; // what the ESP32 pin measures
+  float sensorVolts = 0.0; // reconstructed sensor output
+
+  void sample() {
+    raw         = analogRead(pin);
+    pinVolts    = AdcConfig::toVolts(raw);
+    sensorVolts = pinVolts * dividerRatio;
+  }
+};
+
+// Index names, so the call sites read as names and not as 0/1/2.
+enum AnalogChannelId { CH_TURBIDITY = 0, CH_PH, CH_AMMONIA, CH_COUNT };
+
+AnalogChannel analogChannels[CH_COUNT] = {
+  { TURBIDITY_PIN, 1.0 },                               // no divider
+  { PH_PIN,        PhCalibration::DIVIDER_RATIO },
+  { AMMONIA_PIN,   AmmoniaConfig::DIVIDER_RATIO },
+};
+
+
+class SensorValidity {
+ public:
+  static const unsigned long GRACE_MS = 15000;   // 15 s of silence = really gone
+
+  /// Has this sensor produced a reading recently enough to trust?
+  ///
+  /// The water-temperature and ambient paths both open with the same
+  /// three-part test (ever read at all? how long since the last good
+  /// one? within the grace window?). It was written out twice; this is
+  /// that test, once.
+  static bool isFresh(bool everRead, unsigned long lastOkAt,
+                      unsigned long now) {
+    return everRead && (now - lastOkAt <= GRACE_MS);
+  }
+};
 
 float waterTemperature = 0.0;
 bool  waterTempValid   = false;
@@ -500,12 +872,13 @@ unsigned long lastAmbientOk = 0;
 bool  ambientEverRead = false;
 
 float  relativeTurbidity = 0.0;
-String turbidityStatus   = "--";
+// const char*, not String. statusOf() hands back a literal, so a
+// String here allocated a fresh copy of that literal on every sensor
+// pass and freed it on the next -- pure heap churn for a value that is
+// always one of five compile-time constants.
+const char* turbidityStatus = "--";
 bool   turbidityValid    = false;
 
-int   phADC = 0;          // raw count, 0..4095
-float phPinVoltage = 0.0;  // volts at the pin, before the 2:1 divider
-float phVoltage = 0.0;     // reconstructed probe output
 float pH = 7.0;
 bool  phValid = false;
 
@@ -518,21 +891,24 @@ int  motor2PWM = 0;        // cooling fan
 bool fanActive = false;
 
 
-// =====================================================
-// LCD
-// =====================================================
 
 int lcdPage = 0;
 unsigned long lastLCDUpdate = 0;
-const unsigned long LCD_INTERVAL = 2500;
 
 
 // =====================================================
 // LOCAL SENSOR TIMING
 // =====================================================
+class LocalSensorTiming {
+ public:
+  static const unsigned long READ_INTERVAL_MS = 2000;
+
+  /// Settle time after the rotator stops before the ADC is trusted
+  /// again. See the note on the shared supply above AnalogChannel.
+  static const unsigned long ADC_SETTLE_AFTER_MOTOR_MS = 400;
+};
 
 unsigned long lastSensorRead = 0;
-const unsigned long SENSOR_INTERVAL = 2000;
 
 
 // =====================================================
@@ -546,10 +922,30 @@ const unsigned long SENSOR_INTERVAL = 2000;
 // Identical to the bench sketch. Mirrored in the app by
 // computeFanSpeed() in lib/core/fan_speed_util.dart.
 
-const float COOLING_START = 25.0;
-const float COOLING_MAX   = 40.0;
-const int   COOLING_MIN_PWM = 191;
-const int   COOLING_MAX_PWM = 255;
+class CoolingFanConfig {
+ public:
+  static constexpr float START_C = 25.0;
+  static constexpr float MAX_C   = 40.0;
+  static const int MIN_PWM = 191;
+  static const int MAX_PWM = 255;
+
+  /// Fan PWM for a housing temperature: off below START_C, a linear
+  /// ramp to MAX_C, then full. Identical to the bench sketch and to
+  /// computeFanSpeed() in the app's fan_speed_util.dart.
+  ///
+  /// The ramp MUST stay as Arduino's map() on tenths of a degree. map()
+  /// is integer arithmetic, and passing `housingC * 10` truncates it to
+  /// a long first -- so the result is not the same as the equivalent
+  /// float expression. At 26.7 C the integer form gives 197 and the
+  /// float form 198, because float 26.7 is 26.699999809 and *10
+  /// truncates to 266 rather than 267. Keeping map() keeps the fan
+  /// curve bit-for-bit what it has always been.
+  static int pwmFor(float housingC) {
+    if (housingC < START_C) return 0;
+    if (housingC >= MAX_C)  return MAX_PWM;
+    return map(housingC * 10, START_C * 10, MAX_C * 10, MIN_PWM, MAX_PWM);
+  }
+};
 
 
 // =====================================================
@@ -562,7 +958,6 @@ void   doFeed(int grams, int rotatorPwm);
 void   startRotator(unsigned long ms, int pwm);
 void   serviceRotator();
 void   finishFeed();
-String getAmmoniaStatus(float mgL);
 void   logLine(const String& s, bool verbose = false);
 void   flushLogs();
 bool   logStreaming();
@@ -655,6 +1050,91 @@ String jsonEscape(const char* s) {
 
 /// Bulk-insert the queued lines. PostgREST takes a JSON array, so the
 /// whole batch is one request rather than one per line.
+// =====================================================
+// SHARED TLS CONNECTION TO SUPABASE
+// =====================================================
+// Every cloud call used to declare its own `WiFiClientSecure`, which
+// meant a full TLS handshake per request — key exchange, certificate
+// parsing, the lot. On an ESP32 that is roughly half a second to a
+// second and a half, and it BLOCKS loop() for the whole time.
+//
+// In steady state the device made ~19 of those a minute (commands
+// every 5 s, a reading every 10 s, schedules every 60 s), so a large
+// share of every minute went on handshakes rather than work. That is
+// what made readings arrive late: pushReading() could not get its slot
+// on time, and the app saw gaps far longer than the publish interval.
+//
+// One client, kept open and reused, turns a request into just the POST
+// or GET on an established socket — a few hundred milliseconds at
+// most. That is what makes a 3 s publish interval affordable; raising
+// the rate without this would only have deepened the congestion.
+//
+// The connection is dropped and re-made on transport failure, because
+// the far end may close a socket we still believe is good.
+WiFiClientSecure cloudClient;
+bool cloudTlsConfigured = false;
+
+const unsigned long CLOUD_HTTP_TIMEOUT_MS = 10000;
+
+/// Request failed before any HTTP status came back.
+const int CLOUD_ERR_BEGIN = -1000;
+
+void cloudDropConnection() {
+  cloudClient.stop();
+}
+
+/// One Supabase request over the shared connection.
+///
+/// [method] is "GET", "POST" or "PATCH". [body] is sent for anything
+/// other than GET. When [out] is given the response body is read into
+/// it. [minimal] adds `Prefer: return=minimal`, which stops PostgREST
+/// sending the inserted row back — less for the device to read, and a
+/// faster round trip.
+///
+/// Retries once on a transport-level failure (code < 0), since the
+/// most likely cause is a reused socket the server has since closed.
+int cloudRequest(const String& url, const char* method, const String& body,
+                 String* out = nullptr, bool minimal = false) {
+  if (WiFi.status() != WL_CONNECTED) return CLOUD_ERR_BEGIN;
+
+  if (!cloudTlsConfigured) {
+    // thesis simplicity; pin the CA cert for production-grade TLS
+    cloudClient.setInsecure();
+    cloudTlsConfigured = true;
+  }
+
+  for (int attempt = 0; attempt < 2; attempt++) {
+    HTTPClient http;
+    http.setReuse(true);          // keep the socket open after end()
+    if (!http.begin(cloudClient, url)) return CLOUD_ERR_BEGIN;
+
+    http.addHeader("apikey", SUPABASE_KEY);
+    http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
+    if (body.length()) http.addHeader("Content-Type", "application/json");
+    if (minimal)       http.addHeader("Prefer", "return=minimal");
+    http.setTimeout(CLOUD_HTTP_TIMEOUT_MS);
+
+    int code;
+    if      (strcmp(method, "GET")  == 0) code = http.GET();
+    else if (strcmp(method, "POST") == 0) code = http.POST(body);
+    else                                  code = http.sendRequest(method, body);
+
+    if (code < 0 && attempt == 0) {
+      // Transport failure on a connection we were reusing: drop it and
+      // handshake once more before giving up.
+      http.end();
+      cloudDropConnection();
+      continue;
+    }
+
+    if (out != nullptr && code > 0) *out = http.getString();
+    http.end();                   // keeps the socket open (setReuse)
+    return code;
+  }
+
+  return CLOUD_ERR_BEGIN;
+}
+
 void flushLogs() {
   if (logCount == 0 && !logOverflowed) return;
   if (WiFi.status() != WL_CONNECTED) {
@@ -684,32 +1164,191 @@ void flushLogs() {
   logCount = 0;
   logOverflowed = false;
 
-  WiFiClientSecure client;
-  client.setInsecure();
-
-  HTTPClient http;
-  String url = String(SUPABASE_URL) + "/rest/v1/device_logs";
-  if (!http.begin(client, url)) return;
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("apikey", SUPABASE_KEY);
-  http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
-  http.addHeader("Prefer", "return=minimal");
-  http.setTimeout(10000);
-
-  const int code = http.POST(body);
+  const int code = cloudRequest(
+      String(SUPABASE_URL) + "/rest/v1/device_logs", "POST", body, nullptr, true);
   if (!(code == 200 || code == 201 || code == 204)) {
     // Serial only — logging a failed log upload through logLine() would
     // queue a line that the next flush tries to send, and so on.
     Serial.print("[Cloud] device_logs insert -> HTTP ");
     Serial.println(code);
   }
-  http.end();
 }
 
 
 // =====================================================
 // WIFI
 // =====================================================
+
+// ---- Why a join failed ----
+//
+// This used to print "WiFi: retrying..." forever and nothing else, so
+// a failure to connect looked identical whatever caused it: wrong
+// password, 5 GHz-only SSID, router full, out of range. The radio knows
+// which it was -- the ESP32 reports a numeric reason on every
+// disconnect -- it just was not being read.
+volatile uint8_t wifiLastReason = 0;
+bool wifiHaveReason = false;
+int  wifiFailedAttempts = 0;
+
+/// Set around our own WiFi.disconnect() calls.
+///
+/// Without it the handler below records reason 36 (STA_LEAVING) from the
+/// retry's own disconnect and overwrites whatever the radio actually
+/// reported, so every failure looks like "we left" no matter what went
+/// wrong. The first genuine reason is the useful one, so it is kept.
+bool wifiSelfDisconnect = false;
+
+const char* wifiStatusName(int s) {
+  switch (s) {
+    case WL_IDLE_STATUS:     return "idle";
+    case WL_NO_SSID_AVAIL:   return "SSID not found on 2.4 GHz";
+    case WL_SCAN_COMPLETED:  return "scan done";
+    case WL_CONNECTED:       return "connected";
+    case WL_CONNECT_FAILED:  return "connect failed";
+    case WL_CONNECTION_LOST: return "connection lost";
+    case WL_DISCONNECTED:    return "disconnected";
+    default:                 return "unknown";
+  }
+}
+
+/// The disconnect reason, in terms of what to actually go and change.
+const char* wifiReasonHint(uint8_t r) {
+  switch (r) {
+    case 201: return "NO_AP_FOUND - the radio cannot see that SSID at all. "
+                     "Most likely the hotspot is on 5 GHz (the ESP32 is "
+                     "2.4 GHz ONLY), or the name has a typo/extra space, or "
+                     "it is out of range, or the SSID is hidden.";
+    case 15:  return "4WAY_HANDSHAKE_TIMEOUT - the AP was found and refused "
+                     "the key. Wrong password, or the hotspot is WPA3-only "
+                     "(set it to WPA2-PSK / WPA2-Personal).";
+    case 2:   return "AUTH_EXPIRE - authentication timed out. Weak signal, "
+                     "or WPA3/enterprise security.";
+    case 202: return "AUTH_FAIL - the AP rejected authentication. Usually "
+                     "the password, sometimes WPA3-only or MAC filtering.";
+    case 5:   return "ASSOC_TOOMANY - the hotspot has hit its client limit. "
+                     "Pocket WiFi units often cap at 8-10 devices; "
+                     "disconnect something else and retry.";
+    case 6:
+    case 7:   return "NOT_AUTHED / NOT_ASSOCED - the AP dropped us before "
+                     "the key exchange. Often MAC filtering.";
+    case 23:  return "802_1X_AUTH_FAILED - this is an enterprise network. "
+                     "The firmware only does WPA2-PSK.";
+    case 200: return "BEACON_TIMEOUT - was associated, then stopped hearing "
+                     "the AP. Signal or the hotspot slept.";
+    case 203: return "ASSOC_FAIL - association refused by the AP.";
+    case 204: return "HANDSHAKE_TIMEOUT - key exchange stalled.";
+    case 205: return "CONNECTION_FAIL - generic failure; check the band and "
+                     "the password first.";
+    case 3:
+    case 8:
+    case 36:  return "STA_LEAVING / ASSOC_LEAVE - this board ended the "
+                     "association itself, which is what the retry below "
+                     "does. It masks the real reason rather than being one; "
+                     "read the reason printed on attempt 1.";
+    case 39:  return "TIMEOUT - generic timeout during the join.";
+    default:  return "see esp_wifi_types_generic.h WIFI_REASON_* for this code";
+  }
+}
+
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  if (event != ARDUINO_EVENT_WIFI_STA_DISCONNECTED) return;
+  if (wifiSelfDisconnect) return;          // our own doing, says nothing
+  wifiLastReason = info.wifi_sta_disconnected.reason;
+  wifiHaveReason = true;
+}
+
+/// Scan and say whether the configured SSID is actually visible.
+///
+/// The ESP32 radio is 2.4 GHz only, so "not in this list" is itself the
+/// answer most of the time: a dual-band hotspot advertising one name on
+/// 5 GHz is invisible here and looks exactly like a wrong password.
+///
+/// Blocking for a couple of seconds, which is fine -- it only runs
+/// while there is no WiFi, and nothing else can make progress then.
+void reportVisibleNetworks() {
+  Serial.println();
+  Serial.println("--- 2.4 GHz networks this board can see ---");
+
+  // The radio must be ON and IDLE. Scanning while a join is in flight
+  // returns 0 even with networks all around, which is exactly what made
+  // the first version of this report "(none)" and point the finger at
+  // the band for no reason. So: stop any attempt, let it settle, scan.
+  wifiSelfDisconnect = true;
+  WiFi.disconnect(false, false);     // keep the radio powered
+  delay(200);
+  wifiSelfDisconnect = false;
+
+  // show_hidden = true: a hotspot with a hidden SSID is otherwise
+  // invisible here and looks like the wrong band.
+  const int n = WiFi.scanNetworks(false, true);
+
+  if (n < 0) {
+    Serial.print("  scan failed (");
+    Serial.print(n);
+    Serial.println(") - the radio was busy or is not initialised.");
+    Serial.println("  This is a board-side fault, NOT a hotspot problem.");
+    WiFi.scanDelete();
+    return;
+  }
+  if (n == 0) {
+    Serial.println("  (none) - zero 2.4 GHz APs, not even neighbours'.");
+    Serial.println("  In any populated area that means the RADIO is the");
+    Serial.println("  problem, not the hotspot. Usual causes:");
+    Serial.println("   - under-powered USB supply: the WiFi TX spike (~300 mA)");
+    Serial.println("     browns out the radio. Try a different cable/port, or");
+    Serial.println("     a powered hub, and avoid driving the motors while");
+    Serial.println("     joining.");
+    Serial.println("   - a damaged or unconnected antenna on the module.");
+    WiFi.scanDelete();
+    return;
+  }
+
+  bool found = false;
+  for (int i = 0; i < n; i++) {
+    const String seen = WiFi.SSID(i);
+    const bool mine = seen.equals(ssid);
+    if (mine) found = true;
+
+    Serial.print(mine ? "  >> " : "     ");
+    Serial.print(seen.length() ? seen : String("(hidden)"));
+    Serial.print("   ");
+    Serial.print(WiFi.RSSI(i));
+    Serial.print(" dBm   ch ");
+    Serial.print(WiFi.channel(i));
+    Serial.print("   ");
+    switch (WiFi.encryptionType(i)) {
+      case WIFI_AUTH_OPEN:            Serial.print("OPEN"); break;
+      case WIFI_AUTH_WEP:             Serial.print("WEP"); break;
+      case WIFI_AUTH_WPA_PSK:         Serial.print("WPA"); break;
+      case WIFI_AUTH_WPA2_PSK:        Serial.print("WPA2"); break;
+      case WIFI_AUTH_WPA_WPA2_PSK:    Serial.print("WPA/WPA2"); break;
+      case WIFI_AUTH_WPA3_PSK:        Serial.print("WPA3 (ESP32 may refuse)"); break;
+      case WIFI_AUTH_WPA2_WPA3_PSK:   Serial.print("WPA2/WPA3"); break;
+      case WIFI_AUTH_WPA2_ENTERPRISE: Serial.print("ENTERPRISE (unsupported)"); break;
+      default:                        Serial.print("other"); break;
+    }
+    Serial.println(mine ? "   <= the configured SSID" : "");
+  }
+  WiFi.scanDelete();
+
+  Serial.println();
+  if (found) {
+    Serial.println("  The SSID IS visible, so the name and the band are fine.");
+    Serial.println("  That points at the password, or at WPA3 / MAC filtering /");
+    Serial.println("  the hotspot's client limit. See the reason code above.");
+  } else {
+    Serial.println("  The configured SSID is NOT in that list.");
+    Serial.println("  Check, in this order:");
+    Serial.println("   1. the hotspot's 2.4 GHz radio is ON (ESP32 cannot do 5 GHz)");
+    Serial.println("   2. the SSID in secrets.h matches EXACTLY - case, spaces,");
+    Serial.println("      punctuation. A trailing space is invisible and fatal.");
+    Serial.println("   3. secrets.h was saved AND the sketch re-uploaded. The");
+    Serial.println("      credentials are compiled in, so editing the file alone");
+    Serial.println("      changes nothing on the board.");
+    Serial.println("   4. the board is within a few metres of the hotspot.");
+  }
+  Serial.println("-------------------------------------------");
+}
 
 void startWiFi() {
   Serial.println();
@@ -719,11 +1358,46 @@ void startWiFi() {
   Serial.print("SSID: ");
   Serial.println(ssid);
 
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
+  // Full radio reset, OFF then STA.
+  //
+  // NOT WiFi.disconnect(true, ...) -- that first argument is `wifioff`,
+  // so it powers the radio DOWN, and anything done afterwards (a scan,
+  // in particular) then runs against a dead radio and reports nothing.
+  // Cycling the mode leaves the radio on and initialised, and still
+  // clears any stale association carried over from another network.
   WiFi.persistent(false);
+  WiFi.mode(WIFI_OFF);
+  delay(150);
+  WiFi.mode(WIFI_STA);
+  delay(150);
+
+  // Sleep off while joining. The modem power-save that is on by default
+  // makes association flaky on hotspots with short beacon intervals,
+  // which pocket WiFi units often have.
+  WiFi.setSleep(false);
+
+  // So the failure reason is available when it fails.
+  WiFi.onEvent(onWiFiEvent);
+  wifiHaveReason = false;
+  wifiSelfDisconnect = false;
+  wifiFailedAttempts = 0;
+
   digitalWrite(WIFI_LED_PIN, LOW);
 
+  // The MAC, for checking the hotspot's client list or a MAC filter.
+  Serial.print("This board's MAC: ");
+  Serial.println(WiFi.macAddress());
+  Serial.print("Free heap: ");
+  Serial.print(ESP.getFreeHeap());
+  Serial.println(" bytes");
+  Serial.println("Band: 2.4 GHz only - the ESP32 has no 5 GHz radio.");
+
+  // Scan BEFORE the first join, while the radio is idle. This is the
+  // only moment the scan is trustworthy; once begin() is in flight it
+  // returns 0 regardless of what is in range.
+  reportVisibleNetworks();
+
+  WiFi.setAutoReconnect(true);
   Serial.println("WiFi: connecting...");
   WiFi.begin(ssid, password);
   lastWiFiAttempt = millis();
@@ -757,10 +1431,33 @@ void checkWiFi() {
 
   if (millis() - lastWiFiAttempt >= WIFI_RETRY_INTERVAL) {
     lastWiFiAttempt = millis();
+    wifiFailedAttempts++;
+
     Serial.println();
+    Serial.print("WiFi: attempt ");
+    Serial.print(wifiFailedAttempts);
+    Serial.print(" failed - status: ");
+    Serial.println(wifiStatusName(WiFi.status()));
+
+    if (wifiHaveReason) {
+      Serial.print("  reason ");
+      Serial.print(wifiLastReason);
+      Serial.print(": ");
+      Serial.println(wifiReasonHint(wifiLastReason));
+    }
+
+    // Re-scan occasionally, not every time: it blocks for a couple of
+    // seconds and the answer rarely changes. startWiFi() already
+    // scanned once on a clean radio, which is the reliable one.
+    if (wifiFailedAttempts % 10 == 0) {
+      reportVisibleNetworks();
+    }
+
     Serial.println("WiFi: retrying...");
-    WiFi.disconnect();
-    delay(100);
+    wifiSelfDisconnect = true;
+    WiFi.disconnect(false, false);   // leave the radio powered
+    delay(150);
+    wifiSelfDisconnect = false;
     WiFi.begin(ssid, password);
   }
 }
@@ -773,7 +1470,7 @@ void checkWiFi() {
 // Formulas here are the bench sketch's, unchanged. What is added is the
 // per-sensor validity the app needs in order to show a real "Not
 // Connected" state instead of a stale number — with the grace window
-// described at SENSOR_GRACE_MS so a single dropped read is not treated
+// described at SensorValidity::GRACE_MS so a single dropped read is not treated
 // as a disconnected sensor.
 
 void readSensors() {
@@ -789,7 +1486,8 @@ void readSensors() {
     lastWaterTempOk   = now;
     waterTempEverRead = true;
   }
-  waterTempValid = waterTempEverRead && (now - lastWaterTempOk <= SENSOR_GRACE_MS);
+  waterTempValid =
+      SensorValidity::isFresh(waterTempEverRead, lastWaterTempOk, now);
 
   // ---------------- DHT11 housing/ambient -------------
   float newHumidity       = dht.readHumidity();
@@ -801,72 +1499,80 @@ void readSensors() {
     lastAmbientOk   = now;
     ambientEverRead = true;
   }
-  ambientValid = ambientEverRead && (now - lastAmbientOk <= SENSOR_GRACE_MS);
+  ambientValid = SensorValidity::isFresh(ambientEverRead, lastAmbientOk, now);
+
+  // ---- Analog sensors: only while the rotator is quiet ----
+  //
+  // See LocalSensorTiming::ADC_SETTLE_AFTER_MOTOR_MS. Holding the previous values beats
+  // publishing ones taken through motor noise — a held reading is
+  // merely a couple of seconds stale, whereas a noisy one is wrong and
+  // indistinguishable from a real measurement.
+  if ((long)(now - adcBlockedUntil) < 0) {
+    analogHeld = true;
+    return;
+  }
+  analogHeld = false;
+
+  // ---- The three analog channels, sampled through one pipeline ----
+  //
+  // These were three copied blocks that each did analogRead, then the
+  // same (raw / 4095.0) * 3.3 conversion, then an optional divider
+  // multiply -- the same shape three times, with the conversion
+  // constants written out alongside it three times.
+  //
+  // Now they are an array walked by one loop. What stays separate
+  // below is only what the voltage MEANS per sensor, which genuinely
+  // does differ.
+  for (int i = 0; i < CH_COUNT; i++) analogChannels[i].sample();
+
+  const AnalogChannel& turb = analogChannels[CH_TURBIDITY];
+  const AnalogChannel& phCh = analogChannels[CH_PH];
+  const AnalogChannel& nh3  = analogChannels[CH_AMMONIA];
 
   // ---------------- Turbidity (SEN0189) ---------------
-  turbidityADC = analogRead(TURBIDITY_PIN);
-  turbidityADCVoltage = (turbidityADC / 4095.0) * 3.3;
-  // Any ADC level is a legitimate turbidity reading — a blocked sensor
-  // (very turbid) can read a very low voltage, which must still show as
-  // 100%, not "Not Connected". Whole-device offline is handled by the
-  // app's connection state, so turbidity itself is always valid here.
+
+  // Bench parity: crx_pulse_test.ino has no validity concept for
+  // turbidity at all - it converts whatever the ADC gives and always
+  // reports a percentage. This sketch previously rejected readings at
+  // either rail as implausible, which is why the app and the LCD showed
+  // "Turbidity --" instead of a number.
+  //
+  // Keeping the flag (the `readings` table and the app both read it) but
+  // always true, so the published behaviour matches the bench.
+  //
+  // The cost, stated plainly: a disconnected probe reads ~0 V, and 0 V
+  // converts to a confident "100.0% Highly Turbid" that is
+  // indistinguishable from a real measurement. That is the bench's
+  // behaviour too - it is not a safety check that was lost, it is one
+  // the bench never had.
   turbidityValid = true;
 
-  relativeTurbidity =
-    ((V_CLEAR - turbidityADCVoltage) / (V_CLEAR - V_HIGH)) * 100.0;
-  relativeTurbidity = constrain(relativeTurbidity, 0.0, 100.0);
-
-  if      (turbidityADCVoltage >= TURBIDITY_T1) turbidityStatus = "Clear";
-  else if (turbidityADCVoltage >= TURBIDITY_T2) turbidityStatus = "Slightly Turbid";
-  else if (turbidityADCVoltage >= TURBIDITY_T3) turbidityStatus = "Turbid";
-  else                                          turbidityStatus = "Highly Turbid";
+  relativeTurbidity = TurbidityCalibration::percentOf(turb.pinVolts);
+  turbidityStatus   = TurbidityCalibration::statusOf(relativeTurbidity);
 
   // ---------------- pH (3-point) ----------------------
-  phADC = analogRead(PH_PIN);
-  const float phADCVoltage = (phADC / 4095.0) * 3.3;
-  phPinVoltage = phADCVoltage;
-  phVoltage = phADCVoltage * PH_DIVIDER_RATIO;
-  // A probe that is unplugged reads pinned at one rail; anything inside
-  // the rails is a real measurement.
-  phValid = (phADCVoltage > 0.05 && phADCVoltage < 3.25);
-
-  if (phVoltage >= voltage_pH7) {
-    pH = 7.0 + (phVoltage - voltage_pH7) * (4.0 - 7.0) /
-               (voltage_pH4 - voltage_pH7);
-  } else {
-    pH = 7.0 + (phVoltage - voltage_pH7) * (9.18 - 7.0) /
-               (voltage_pH9 - voltage_pH7);
-  }
-  pH = constrain(pH, 0.0, 14.0);
+  // Bench parity, as for turbidity above: crx_pulse_test.ino converts
+  // and reports unconditionally, with no rail check.
+  phValid = true;
+  pH = PhCalibration::valueOf(analogChannels[CH_PH].sensorVolts);
 
   // ---------------- MQ-137 ammonia --------------------
-  ammoniaADC = analogRead(AMMONIA_PIN);
-  ammoniaADCVoltage    = (ammoniaADC / 4095.0) * 3.3;
-  ammoniaSensorVoltage = ammoniaADCVoltage * AMMONIA_DIVIDER_RATIO;
-  // "Valid" = the sensor is electrically present (reading something).
-  // This does NOT depend on the calibration band, so the app shows a
-  // number instead of "Not Connected" when the MQ-137 sits outside it.
-  ammoniaValid = (ammoniaADCVoltage > 0.02);
 
-  // NH4/NH3 estimate (mg/L) — the bench sketch's two-segment
-  // interpolation across the Sera reference points, CLAMPED to the span
-  // those points cover. Outside the band the reading is reported at the
-  // nearest calibrated end and flagged "[est]"; this firmware does not
-  // extrapolate a concentration it has never been calibrated for.
-  const float v = ammoniaSensorVoltage;
-  ammoniaInCalibrationRange = (v >= AMMONIA_V0 && v <= AMMONIA_V2);
+  // NH4/NH3 estimate (mg/L) - crx_pulse_test.ino's logic. Computed
+  // ONLY inside the Sera band; outside it the bench sketch does not
+  // clamp to an end of the curve, and neither does this.
+  //
+  // That clamp is where "0.53 mg/L (Critical)" came from: 0.53 is
+  // simply C2, the top reference point, reported as though the sensor
+  // had produced it while it actually sat 0.19 V beyond.
+  ammoniaInCalibrationRange =
+      AmmoniaConfig::inCalibrationRange(analogChannels[CH_AMMONIA].sensorVolts);
+  ammoniaEstimatedMgL = AmmoniaConfig::mgLOf(analogChannels[CH_AMMONIA].sensorVolts);
 
-  if (v <= AMMONIA_V0) {
-    ammoniaEstimatedMgL = AMMONIA_C0;
-  } else if (v <= AMMONIA_V1) {
-    ammoniaEstimatedMgL = AMMONIA_C0 +
-        (v - AMMONIA_V0) * (AMMONIA_C1 - AMMONIA_C0) / (AMMONIA_V1 - AMMONIA_V0);
-  } else if (v <= AMMONIA_V2) {
-    ammoniaEstimatedMgL = AMMONIA_C1 +
-        (v - AMMONIA_V1) * (AMMONIA_C2 - AMMONIA_C1) / (AMMONIA_V2 - AMMONIA_V1);
-  } else {
-    ammoniaEstimatedMgL = AMMONIA_C2;   // above the top reference: clamp, don't invent
-  }
+  // Always valid now: mgLOf() clamps instead of refusing, so there is
+  // always a figure to publish. The app showed "Not Connected" for any
+  // reading outside the Sera band, which is what this removes.
+  ammoniaValid = true;
 }
 
 
@@ -881,16 +1587,9 @@ void controlCoolingMotor() {
   // temperature. Only a genuinely dead DHT11 (silent past the grace
   // window) holds the fan OFF — a single dropped read must not cut
   // cooling, which is what used to happen here.
-  if (!ambientValid) {
-    pwm = 0;
-  } else if (airTemperature < COOLING_START) {
-    pwm = 0;
-  } else if (airTemperature < COOLING_MAX) {
-    pwm = map(airTemperature * 10, COOLING_START * 10, COOLING_MAX * 10,
-              COOLING_MIN_PWM, COOLING_MAX_PWM);
-  } else {
-    pwm = COOLING_MAX_PWM;
-  }
+  // Only a genuinely dead DHT11 holds the fan off; the curve itself is
+  // CoolingFanConfig's business.
+  pwm = ambientValid ? CoolingFanConfig::pwmFor(airTemperature) : 0;
 
   pwm = constrain(pwm, 0, 255);
   motor2PWM = pwm;
@@ -959,15 +1658,15 @@ void servoTest(bool open) {
   }
 
   if (open) {
-    myServo.write(SERVO_OPEN_ANGLE);
-    servoPosition = SERVO_OPEN_ANGLE;
-    servoTestOpenedAt = millis();
-    logLine("[Test] Servo -> OPEN " + String(SERVO_OPEN_ANGLE) + " degrees");
+    myServo.write(ServoConfig::OPEN_ANGLE);
+    servoPosition = ServoConfig::OPEN_ANGLE;
+    ComponentSafetyTestTimers::servoOpenedAt = millis();
+    logLine("[Test] Servo -> OPEN " + String(ServoConfig::OPEN_ANGLE) + " degrees");
   } else {
-    myServo.write(SERVO_CLOSED_ANGLE);
-    servoPosition = SERVO_CLOSED_ANGLE;
-    servoTestOpenedAt = 0;
-    logLine("[Test] Servo -> CLOSED " + String(SERVO_CLOSED_ANGLE) + " degrees");
+    myServo.write(ServoConfig::CLOSED_ANGLE);
+    servoPosition = ServoConfig::CLOSED_ANGLE;
+    ComponentSafetyTestTimers::servoOpenedAt = 0;
+    logLine("[Test] Servo -> CLOSED " + String(ServoConfig::CLOSED_ANGLE) + " degrees");
   }
 }
 
@@ -979,7 +1678,7 @@ void motorTest(int pwm) {
 
   motor1PWM = constrain(pwm, 0, 255);
   analogWrite(MOTOR1_EN, motor1PWM);
-  motorTestStartedAt = (motor1PWM > 0) ? millis() : 0;
+  ComponentSafetyTestTimers::motorStartedAt = (motor1PWM > 0) ? millis() : 0;
 
   logLine("[Test] Rotator -> " + String(motor1PWM) + "/255 (" +
           String((int)((motor1PWM / 255.0) * 100)) + "%)");
@@ -987,19 +1686,23 @@ void motorTest(int pwm) {
 
 /// Enforce the deadlines above. Called every loop pass.
 void checkTestTimeouts() {
-  if (servoTestOpenedAt != 0 &&
-      millis() - servoTestOpenedAt >= SERVO_TEST_MAX_OPEN_MS) {
-    myServo.write(SERVO_CLOSED_ANGLE);
-    servoPosition = SERVO_CLOSED_ANGLE;
-    servoTestOpenedAt = 0;
+  const unsigned long now = millis();
+
+  if (ComponentSafetyTestTimers::expired(
+          ComponentSafetyTestTimers::servoOpenedAt,
+          ComponentSafetyTestTimers::SERVO_MAX_OPEN_MS, now)) {
+    myServo.write(ServoConfig::CLOSED_ANGLE);
+    servoPosition = ServoConfig::CLOSED_ANGLE;
+    ComponentSafetyTestTimers::servoOpenedAt = 0;
     logLine("[Test] Servo auto-closed after 10 s");
   }
 
-  if (motorTestStartedAt != 0 &&
-      millis() - motorTestStartedAt >= MOTOR_TEST_MAX_MS) {
+  if (ComponentSafetyTestTimers::expired(
+          ComponentSafetyTestTimers::motorStartedAt,
+          ComponentSafetyTestTimers::MOTOR_MAX_MS, now)) {
     motor1PWM = 0;
     analogWrite(MOTOR1_EN, motor1PWM);
-    motorTestStartedAt = 0;
+    ComponentSafetyTestTimers::motorStartedAt = 0;
     logLine("[Test] Rotator auto-stopped after 30 s");
   }
 }
@@ -1018,10 +1721,10 @@ void doFeed(int grams, int rotatorPwm) {
 
   // A feed owns both actuators, so cancel any test deadline rather than
   // letting a timer fire part-way through the cycle.
-  servoTestOpenedAt = 0;
-  motorTestStartedAt = 0;
+  ComponentSafetyTestTimers::servoOpenedAt = 0;
+  ComponentSafetyTestTimers::motorStartedAt = 0;
 
-  unsigned long openMs = gramsToOpenMs(grams);
+  unsigned long openMs = ServoConfig::openMsForGrams(grams);
 
   logLine("[Feed] Dispensing " + String(grams) + " g  (open " +
           String(openMs) + " ms, rotator " +
@@ -1039,24 +1742,24 @@ void doFeed(int grams, int rotatorPwm) {
   lcd.print("Dispensing...");
 
   // 1-3: servo opens, holds for the gram time, closes.
-  myServo.write(SERVO_OPEN_ANGLE);
-  servoPosition = SERVO_OPEN_ANGLE;
+  myServo.write(ServoConfig::OPEN_ANGLE);
+  servoPosition = ServoConfig::OPEN_ANGLE;
   delay(openMs);
-  myServo.write(SERVO_CLOSED_ANGLE);
-  servoPosition = SERVO_CLOSED_ANGLE;
+  myServo.write(ServoConfig::CLOSED_ANGLE);
+  servoPosition = ServoConfig::CLOSED_ANGLE;
 
   // 4: wait for the feed to drop.
   logLine("[Feed] Settling 1.5 s before rotating...");
   lcd.setCursor(0, 1);
   lcd.print("Settling...  ");
-  delay(FEED_SETTLE_MS);
+  delay(FeedController::SETTLE_MS);
 
   // 5: start the rotation and return. serviceRotator() stops the
   // motor when its deadline passes and clears feedInProgress then —
   // loop() keeps running throughout, so the cloud layer stays alive.
   lcd.setCursor(0, 1);
   lcd.print("Rotating...  ");
-  startRotator(ROTATOR_RUN_MS, rotatorPwm);
+  startRotator(FeedController::ROTATOR_RUN_MS, rotatorPwm);
 }
 
 
@@ -1066,21 +1769,6 @@ void doFeed(int grams, int rotatorPwm) {
 
 void pushReading() {
   if (WiFi.status() != WL_CONNECTED) return;
-
-  WiFiClientSecure client;
-  client.setInsecure();   // thesis simplicity; pin the CA cert for production-grade TLS
-
-  HTTPClient http;
-  String url = String(SUPABASE_URL) + "/rest/v1/readings";
-  if (!http.begin(client, url)) {
-    Serial.println("[Cloud] readings insert begin() failed");
-    return;
-  }
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("apikey", SUPABASE_KEY);
-  http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
-  http.addHeader("Prefer", "return=minimal");
-  http.setTimeout(10000);
 
   // Postgres columns are snake_case.
   StaticJsonDocument<512> doc;
@@ -1102,16 +1790,17 @@ void pushReading() {
   String payload;
   serializeJson(doc, payload);
 
-  int code = http.POST(payload);
+  String response;
+  const int code = cloudRequest(String(SUPABASE_URL) + "/rest/v1/readings",
+                                "POST", payload, &response, true);
   if (code == 200 || code == 201 || code == 204) {
-    // Verbose: one of these every 10 s forever, so it only reaches the
-    // app's console while somebody is watching it.
+    // Verbose: one of these every few seconds forever, so it only
+    // reaches the app's console while somebody is watching it.
     logLine("[Cloud] Reading stored", true);
   } else {
     logLine("[Cloud] readings insert -> HTTP " + String(code));
-    logLine(http.getString());   // PostgREST prints the reason
+    if (response.length()) logLine(response);   // PostgREST prints the reason
   }
-  http.end();
 }
 
 
@@ -1128,27 +1817,14 @@ void pollCommands() {
   if (WiFi.status() != WL_CONNECTED) return;
   if (feedInProgress) return;
 
-  WiFiClientSecure client;
-  client.setInsecure();
-
-  HTTPClient http;
   String url = String(SUPABASE_URL) +
                "/rest/v1/commands?select=id,type,grams,value,rotator_pwm,created_at"
                "&device_id=eq." + DEVICE_ID +
                "&handled=eq.false&order=created_at.asc&limit=1";
-  if (!http.begin(client, url)) return;
-  http.addHeader("apikey", SUPABASE_KEY);
-  http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
-  http.setTimeout(10000);
 
-  int code = http.GET();
-  if (code != 200) {
-    http.end();
-    return;
-  }
-
-  String body = http.getString();
-  http.end();
+  String body;
+  const int code = cloudRequest(url, "GET", "", &body);
+  if (code != 200) return;
 
   // PostgREST returns a bare JSON array, e.g. [ { "id": "...", ... } ].
   StaticJsonDocument<1024> doc;
@@ -1260,25 +1936,14 @@ long commandAgeSeconds(const String& createdAt) {
 bool ackCommand(const String& id) {
   if (WiFi.status() != WL_CONNECTED) return false;
 
-  WiFiClientSecure client;
-  client.setInsecure();
-
-  HTTPClient http;
   // PATCH the one row: mark it handled so it isn't run twice.
-  String url = String(SUPABASE_URL) + "/rest/v1/commands?id=eq." + id;
-  if (!http.begin(client, url)) return false;
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("apikey", SUPABASE_KEY);
-  http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
-  http.addHeader("Prefer", "return=minimal");
-  http.setTimeout(10000);
-
+  //
   // Only `handled` is set here. handled_at is left to the database (a
   // JSON string like "now()" is not a timestamptz literal, so sending
   // one would make PostgREST reject the whole PATCH with a 400).
-  String payload = "{\"handled\":true}";
-  int code = http.sendRequest("PATCH", payload);   // no PATCH() helper on all cores
-  http.end();
+  const int code = cloudRequest(
+      String(SUPABASE_URL) + "/rest/v1/commands?id=eq." + id,
+      "PATCH", "{\"handled\":true}", nullptr, true);
 
   const bool ok = (code == 200 || code == 204);
   if (!ok) {
@@ -1296,26 +1961,13 @@ bool ackCommand(const String& id) {
 void refreshSchedules() {
   if (WiFi.status() != WL_CONNECTED) return;
 
-  WiFiClientSecure client;
-  client.setInsecure();
-
-  HTTPClient http;
   String url = String(SUPABASE_URL) +
                "/rest/v1/schedules?select=id,time,grams,rotator_pwm,active"
                "&device_id=eq." + DEVICE_ID + "&active=eq.true";
-  if (!http.begin(client, url)) return;
-  http.addHeader("apikey", SUPABASE_KEY);
-  http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
-  http.setTimeout(10000);
 
-  int code = http.GET();
-  if (code != 200) {
-    http.end();
-    return;
-  }
-
-  String body = http.getString();
-  http.end();
+  String body;
+  const int code = cloudRequest(url, "GET", "", &body);
+  if (code != 200) return;
 
   // PostgREST returns a bare JSON array.
   StaticJsonDocument<2048> doc;
@@ -1376,7 +2028,7 @@ void setMotor1(int pwm) {
   analogWrite(MOTOR1_EN, motor1PWM);
   // Same deadline as a motor_test from the app: a bench key must not
   // leave the rotator running either.
-  motorTestStartedAt = (motor1PWM > 0) ? millis() : 0;
+  ComponentSafetyTestTimers::motorStartedAt = (motor1PWM > 0) ? millis() : 0;
   logLine("Motor 1 (rotator) PWM: " + String(motor1PWM) + " / 255   " +
           String((int)((motor1PWM / 255.0) * 100.0)) + "%");
 }
@@ -1419,11 +2071,15 @@ void checkSerialCommand() {
 //
 // Bench-sketch bands. Mirrored by the app in firmware_spec.dart.
 
-String getAmmoniaStatus(float mgL) {
-  if (mgL < 0.25) return "Safe";
-  if (mgL < 0.50) return "Warning";
-  return "Critical";
-}
+
+
+/// Same bands, abbreviated for the 16-column LCD.
+///
+/// "0.53 mg/L Critical" is 18 characters and would be cut mid-word by
+/// the panel; "0.53 mg/L Crit" is 14 and fits. The serial output and
+/// the app still use the full words.
+
+
 
 
 // =====================================================
@@ -1432,7 +2088,7 @@ String getAmmoniaStatus(float mgL) {
 
 // Built as whole lines so each one can go to Serial AND to the app's
 // console through logLine(). These are the high-volume lines (every
-// SENSOR_INTERVAL), so they are marked verbose: Serial always gets
+// LocalSensorTiming::READ_INTERVAL_MS), so they are marked verbose: Serial always gets
 // them, the cloud only while log streaming is on.
 #define LOG_V(s) logLine((s), true)
 
@@ -1449,32 +2105,75 @@ void printSensorData() {
   LOG_V("Humidity:   " +
         (ambientValid ? String(humidity) + " %" : String("Not Connected")));
 
-  if (turbidityValid) {
-    LOG_V("Turbidity:  " + String(relativeTurbidity, 2) + "% (" + turbidityStatus +
-          ")   |   ADC: " + String(turbidityADC) +
-          "   ADC V: " + String(turbidityADCVoltage, 3) + " V");
-  } else {
-    LOG_V("Turbidity:  Not Connected");
+  if (analogHeld) {
+    LOG_V("            (rotator running - pH / turbidity / ammonia below are "
+          "the last quiet readings, not fresh samples)");
   }
 
-  if (phValid) {
-    LOG_V("pH:         " + String(pH, 2) +
-          "   |   ADC: " + String(phADC) +
-          "   pin: " + String(phPinVoltage, 3) + " V" +
-          "   probe: " + String(phVoltage, 3) + " V");
-  } else {
-    LOG_V("pH:         Not Connected   |   ADC: " + String(phADC) +
-          "   pin: " + String(phPinVoltage, 3) + " V");
+  // The bench's line: always the percentage and status, whatever the
+  // ADC says.
+  LOG_V("Turbidity:  " + String(relativeTurbidity, 2) + "% (" + turbidityStatus +
+        ")   |   ADC: " + String(analogChannels[CH_TURBIDITY].raw) +
+        "   ADC V: " + String(analogChannels[CH_TURBIDITY].pinVolts, 3) + " V");
+
+  // Additive only — the percentage above is reported either way. This
+  // just says the input is far below the calibrated 100% point
+  // (TurbidityCalibration::V_HIGH = 1.1916 V), which has two very different causes:
+  //
+  //   - a deliberately covered or heavily fouled probe. Blocking the
+  //     optical path drives the output below where TurbidityCalibration::V_HIGH was measured
+  //     with a turbidity standard, so near-0 V is a REAL reading here,
+  //     just off the end of the curve. 100% is the right answer.
+  //
+  //   - the board unpowered, the signal on the wrong pin, or a
+  //     connector seated one position over. GPIO34 is input-only with
+  //     no internal pull, so a steady zero means something is actively
+  //     holding it down.
+  //
+  // Uncovering the probe tells them apart: a working sensor climbs back
+  // toward TurbidityCalibration::V_CLEAR, a wiring fault stays pinned.
+  if (analogChannels[CH_TURBIDITY].raw < TurbidityCalibration::ADC_MIN_VALID) {
+    LOG_V("            ^ note: ADC is near 0 V, below the calibrated 100% "
+          "point. Expected for a covered/fouled probe. If it stays there "
+          "uncovered, check power, the A pin and the connector.");
+  } else if (analogChannels[CH_TURBIDITY].raw > TurbidityCalibration::ADC_MAX_VALID) {
+    LOG_V("            ^ note: ADC is railed HIGH - the signal wire is "
+          "probably broken.");
   }
 
-  if (ammoniaValid) {
-    String line = "Ammonia:    " + String(ammoniaEstimatedMgL, 2) + " mg/L (" +
-                  getAmmoniaStatus(ammoniaEstimatedMgL) + ")";
-    if (!ammoniaInCalibrationRange) line += " [est — outside calibrated band]";
-    line += "   |   Sensor: " + String(ammoniaSensorVoltage, 3) + " V";
+  // As for turbidity: the bench prints the converted pH unconditionally.
+  LOG_V("pH:         " + String(pH, 2) +
+        "   |   ADC: " + String(analogChannels[CH_PH].raw) +
+        "   pin: " + String(analogChannels[CH_PH].pinVolts, 3) + " V" +
+        "   probe: " + String(analogChannels[CH_PH].sensorVolts, 3) + " V");
+
+  // Ammonia. Always a number now: mgLOf() clamps to the calibrated
+  // span rather than reporting "-- out of range" or "Not Connected",
+  // so the reading starts at 0 and the voltage is always shown beside
+  // it. A clamped value is marked, because 0.00 at the floor and 0.53
+  // at the ceiling are limits rather than measurements.
+  LOG_V("NH3 ADC: " + String(analogChannels[CH_AMMONIA].raw) +
+        "   ADC V: " + String(analogChannels[CH_AMMONIA].pinVolts, 3) + " V" +
+        "   Sensor: " + String(analogChannels[CH_AMMONIA].sensorVolts, 3) + " V");
+
+  {
+    const float v = analogChannels[CH_AMMONIA].sensorVolts;
+    String line = "Ammonia:    " + String(ammoniaEstimatedMgL, 2) + " mg/L" +
+                  "   (" + String(v, 3) + " V)" +
+                  "   Status: " + AmmoniaConfig::statusOf(ammoniaEstimatedMgL);
+
+    if (AmmoniaConfig::belowRange(v)) {
+      line += "   |   at floor: " + String(v, 3) + " V is below the " +
+              String(AmmoniaConfig::V0, 3) + " V zero reference";
+    } else if (AmmoniaConfig::aboveRange(v)) {
+      line += "   |   OUT OF BAND (high): " + String(v, 3) + " V is " +
+              String(v - AmmoniaConfig::V2, 3) + " V above the " +
+              String(AmmoniaConfig::V2, 3) + " V top reference. Reading "
+              "forced to 0.00 - the curve does not describe this sensor "
+              "here, so this 0.00 is NOT proof the water is clean. "
+              "Recalibrate the MQ-137 to get real mg/L.";
+    }
     LOG_V(line);
-  } else {
-    LOG_V("Ammonia:    Not Connected");
   }
 
   LOG_V("Fan:        " + String(fanActive ? "ON " : "OFF ") +
@@ -1502,7 +2201,7 @@ void updateLCD() {
       else lcd.print("--");
       lcd.setCursor(0, 1);
       lcd.print("pH:");
-      if (phValid) lcd.print(pH, 2); else lcd.print("--");
+      lcd.print(pH, 2);          // bench parity: always shown
       break;
 
     case 1:  // Housing temp + humidity
@@ -1518,21 +2217,24 @@ void updateLCD() {
 
     case 2:  // Turbidity
       lcd.setCursor(0, 0);
-      lcd.print(turbidityValid ? turbidityStatus : "Turbidity --");
+      lcd.print(turbidityStatus);   // bench parity: always shown
       lcd.setCursor(0, 1);
-      if (turbidityValid) { lcd.print(relativeTurbidity, 1); lcd.print("% turbid"); }
-      else lcd.print("Not Connected");
+      lcd.print(relativeTurbidity, 1);
+      lcd.print("% turbid");
       break;
 
     case 3:  // Ammonia
+      // Both lines sized for 16 columns: mg/L is always 4 characters
+      // (0.00 .. 0.53) and the voltage 5, so the longest status word
+      // still fits.
       lcd.setCursor(0, 0);
-      lcd.print("Ammonia mg/L");
+      lcd.print("Ammonia ");
+      lcd.print(ammoniaEstimatedMgL, 2);
+      lcd.print("mg/L");
       lcd.setCursor(0, 1);
-      if (ammoniaValid) {
-        lcd.print(ammoniaEstimatedMgL, 2);
-        lcd.print(" ");
-        lcd.print(getAmmoniaStatus(ammoniaEstimatedMgL));
-      } else lcd.print("Not Connected");
+      lcd.print(analogChannels[CH_AMMONIA].sensorVolts, 3);
+      lcd.print("V ");
+      lcd.print(AmmoniaConfig::statusOf(ammoniaEstimatedMgL));
       break;
 
     case 4:  // Both motors, as on the bench sketch's motor page
@@ -1549,7 +2251,7 @@ void updateLCD() {
   }
 
   lcdPage++;
-  if (lcdPage > 4) lcdPage = 0;
+  if (lcdPage >= LCDConfig::PAGE_COUNT) lcdPage = 0;
 }
 
 
@@ -1607,8 +2309,8 @@ void setup() {
   ESP32PWM::allocateTimer(0);
   myServo.setPeriodHertz(50);
   myServo.attach(SERVO_PIN, 500, 2400);
-  myServo.write(SERVO_CLOSED_ANGLE);
-  servoPosition = SERVO_CLOSED_ANGLE;
+  myServo.write(ServoConfig::CLOSED_ANGLE);
+  servoPosition = ServoConfig::CLOSED_ANGLE;
 
   // Motor 1 (DC rotator)
   pinMode(MOTOR1_EN, OUTPUT);
@@ -1654,19 +2356,29 @@ void loop() {
   // Stop the post-feed rotation when its deadline passes.
   serviceRotator();
 
+  // Keep pushing the ADC block forward for as long as the rotator is
+  // drawing current, so analog sampling resumes only once it has been
+  // stopped for LocalSensorTiming::ADC_SETTLE_AFTER_MOTOR_MS. Done here rather than at
+  // each motor1PWM write: this catches every path that energises it
+  // (feed, schedule, Test Components, serial) without having to
+  // remember to touch them all.
+  if (motor1PWM > 0) {
+    adcBlockedUntil = millis() + LocalSensorTiming::ADC_SETTLE_AFTER_MOTOR_MS;
+  }
+
   // Close the feeder door / stop the rotator if a Test Components
   // command left either running. Must be before anything that blocks.
   checkTestTimeouts();
 
   // Local sensor refresh + fan control + serial print + LCD
-  if (millis() - lastSensorRead >= SENSOR_INTERVAL) {
+  if (millis() - lastSensorRead >= LocalSensorTiming::READ_INTERVAL_MS) {
     lastSensorRead = millis();
     readSensors();
     controlCoolingMotor();
     printSensorData();
   }
 
-  if (millis() - lastLCDUpdate >= LCD_INTERVAL) {
+  if (millis() - lastLCDUpdate >= LCDConfig::UPDATE_INTERVAL_MS) {
     lastLCDUpdate = millis();
     updateLCD();
   }
