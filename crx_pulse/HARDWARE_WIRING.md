@@ -178,7 +178,7 @@ GPIO 35 therefore sees **half** the MQ-137 output; the firmware multiplies by `A
 | VCC (motor supply) | 7–12V |
 | GND | **shared with ESP32 GND** |
 
-Direction is fixed in `setup()` (IN1 LOW, IN2 HIGH) and speed comes from PWM on ENA. The rotator runs **only after a feed**: the servo closes, the firmware waits `FEED_SETTLE_MS` (1.5 s) for the feed to drop, then spins the rotator at full speed for `ROTATOR_RUN_MS` (2.0 s).
+Direction is fixed in `setup()` (IN1 LOW, IN2 HIGH) and speed comes from PWM on ENA. The rotator runs **before a feed**: it spins for `FeedController::ROTATOR_RUN_MS` (12 s) at the speed selected in the app, then stops. The firmware waits `FeedController::SETTLE_MS` (1.5 s) before the servo opens and drops the feed. Rotator speed Off skips the spin and the settle; the servo still dispenses.
 
 If the rotator spins the wrong way, swap IN1/IN2 — either the wires or the two `digitalWrite()` calls in `setup()`.
 

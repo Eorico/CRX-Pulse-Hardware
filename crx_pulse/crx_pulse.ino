@@ -101,16 +101,16 @@
  *          IS the link. Event lines always; the sensor block only while
  *          a "log_stream" command is in force.
  *
- *  FEEDING (servo) + DELAY-ROTATION (DC rotator motor):
+ *  FEEDING (DC rotator motor) + SERVO DROP:
  *     On every feed (manual command OR schedule):
- *       1. Servo opens to ServoConfig::OPEN_ANGLE (160 deg).
- *       2. Held open for the gram-calibrated time (5g=400ms ... 30g=2400ms).
- *       3. Servo returns to ServoConfig::CLOSED_ANGLE (180 deg).
- *       4. Wait FeedController::SETTLE_MS (1.5 s) for the feed to drop.
- *       5. Run the DC rotator (Motor 1) for FeedController::ROTATOR_RUN_MS (12 s) at the
- *          speed the command/schedule asked for, then stop. The app
+ *       1. Run the DC rotator (Motor 1) for FeedController::ROTATOR_RUN_MS (12 s)
+ *          at the speed the command/schedule asked for, then stop. The app
  *          offers the five PWM levels the bench sketch tested
  *          (0/90/128/191/255); 0 skips the rotation entirely.
+ *       2. After the motor stops, wait FeedController::SETTLE_MS (1.5 s).
+ *       3. Servo opens to ServoConfig::OPEN_ANGLE (160 deg).
+ *       4. Held open for the gram-calibrated time (5g=400ms ... 30g=2400ms).
+ *       5. Servo returns to ServoConfig::CLOSED_ANGLE (180 deg).
  *
  *  TEST COMPONENTS (app Settings tab):
  *     servo_open / servo_close / motor_test drive the actuators
@@ -133,6 +133,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <WebServer.h>
 #include <ArduinoJson.h>
 #include <time.h>
 #include <DHT.h>
@@ -186,6 +187,10 @@ const unsigned long WIFI_RETRY_INTERVAL = 10000;
 //
 // The anon key is safe to embed (it is designed to be public and is
 // bounded by the RLS policies you create in the SQL editor).
+
+// Short build tag shown in the app's Device Setup screen. Kept here rather
+// than in secrets.h so it can change without touching credentials.
+static const char* FIRMWARE_BUILD_TAG = "2026.11.23-motor-first";
 
 // How often the ESP32 pushes a reading to Supabase, and polls for
 // commands / schedules. These are the CLOUD cadences; the LCD and the
@@ -301,7 +306,7 @@ const unsigned long SCHEDULE_CHECK_INTERVAL = 1000;
 
 
 // =====================================================
-// L298N MOTOR 1  ->  DC ROTATOR (runs after each feed)
+// L298N MOTOR 1  ->  DC ROTATOR (runs before each feed)
 // =====================================================
 
 #define MOTOR1_EN 25
@@ -392,10 +397,10 @@ class ServoConfig {
 // functions share, which was previously six loose globals.
 class FeedController {
  public:
-  // Delay-rotation of the DC rotator after feed is released.
-  static const unsigned long SETTLE_MS = 1500;   // 1.5 s after the door closes
+  // Pause after the rotator stops, before the feeder door opens.
+  static const unsigned long SETTLE_MS = 1500;   // 1.5 s after the motor stops
 
-  // How long the DC rotator spins after each feed. 2 s was not enough
+  // How long the DC rotator spins before each feed. 2 s was not enough
   // to complete a turn; 10-15 s is. Anywhere in that range is fine.
   static const unsigned long ROTATOR_RUN_MS = 12000;  // 12 s
 };
@@ -411,6 +416,10 @@ class FeedController {
 // So the rotation is a deadline serviced from loop() instead.
 // rotatorStopAt == 0 means idle.
 unsigned long rotatorStopAt = 0;
+
+// Gram-calibrated door-open time for the feed in flight. The rotator
+// deadline is serviced from loop(), so the servo phase reads it later.
+unsigned long feedOpenMs = 0;
 
 // Making the rotation non-blocking had a side effect on the ADC.
 //
@@ -440,8 +449,9 @@ unsigned long adcBlockedUntil = 0;
 // and ammonia lines repeat during a feed and look like a frozen sensor.
 bool analogHeld = false;
 
-// doFeed() is blocking (it uses delay()), so a schedule cannot interrupt
-// a command feed. This flag is belt-and-braces for the same guarantee.
+// A feed owns both actuators from the moment doFeed() runs until the
+// servo phase calls finishFeed(). This flag stops a schedule or command
+// from starting a second cycle while the first one is in flight.
 bool feedInProgress = false;
 
 
@@ -934,12 +944,17 @@ class CoolingFanConfig {
   /// computeFanSpeed() in the app's fan_speed_util.dart.
   ///
   /// The ramp MUST stay as Arduino's map() on tenths of a degree. map()
-  /// is integer arithmetic, and passing `housingC * 10` truncates it to
-  /// a long first -- so the result is not the same as the equivalent
-  /// float expression. At 26.7 C the integer form gives 197 and the
-  /// float form 198, because float 26.7 is 26.699999809 and *10
-  /// truncates to 266 rather than 267. Keeping map() keeps the fan
-  /// curve bit-for-bit what it has always been.
+  /// is integer arithmetic on a value truncated to a long, so it does
+  /// NOT agree with the equivalent float expression: the two differ at
+  /// 280 of the 1501 tenth-degree steps between 25 and 40 C. The first
+  /// is 25.24 C, where map() gives 191 and the float form 192.
+  ///
+  /// (An earlier version of this comment claimed the split showed at
+  /// 26.7 C, 197 against 198. That was wrong -- 26.7f * 10 is exactly
+  /// 267.0, so both forms give 198 there. The conclusion stands, the
+  /// example did not; measured, not assumed, this time.)
+  ///
+  /// Keeping map() keeps the fan curve bit-for-bit what it has been.
   static int pwmFor(float housingC) {
     if (housingC < START_C) return 0;
     if (housingC >= MAX_C)  return MAX_PWM;
@@ -957,6 +972,7 @@ long   commandAgeSeconds(const String& createdAt);
 void   doFeed(int grams, int rotatorPwm);
 void   startRotator(unsigned long ms, int pwm);
 void   serviceRotator();
+void   beginServoPhase(bool afterRotation);
 void   finishFeed();
 void   logLine(const String& s, bool verbose = false);
 void   flushLogs();
@@ -1350,6 +1366,221 @@ void reportVisibleNetworks() {
   Serial.println("-------------------------------------------");
 }
 
+// =====================================================
+// OFFLINE ACCESS POINT + LOCAL READ-ONLY API
+// =====================================================
+//
+// Purpose: when the tank's WiFi is not available, the device raises its
+// own access point so a phone can join it directly and keep watching
+// readings. The phone stores what it pulls and uploads it to Supabase
+// later, once it has internet again.
+//
+// Everything here is ADDITIVE. It reads the same globals readSensors()
+// already fills and writes none of them, so the sensor pipeline, the
+// calibration, the LCD and the 3 s cloud push behave exactly as before.
+// If the AP is never raised, not one line of this runs.
+//
+// The real AP password lives in secrets.h, which is gitignored --
+// secrets.h is included above, so its #define wins over the fallback
+// here. This fallback only exists so the sketch still builds for
+// someone who has not set one, and is deliberately not a password
+// anybody should ship: WPA2 needs 8-63 characters, and this is a
+// placeholder, not a secret.
+#ifndef AP_PASSWORD
+#define AP_PASSWORD "CHANGE_ME_IN_SECRETS_H"
+#endif
+
+// Raise the AP once the station has been down this long. Deliberately
+// short: the point is that somebody standing at the tank does not wait.
+const unsigned long AP_FALLBACK_AFTER_MS = 5000;
+
+// Once WiFi is back, keep the AP up this long after the last client
+// leaves, so a phone mid-session is not dropped the moment the router
+// reappears.
+const unsigned long AP_LINGER_AFTER_STA_MS = 60000;
+
+WebServer apServer(80);
+
+bool apActive = false;
+bool apServerStarted = false;
+unsigned long staDownSince = 0;     // 0 = station is up (or never tried)
+unsigned long apClientsLastSeen = 0;
+
+// Last client count we announced, so a join or a leave is logged once
+// instead of on every loop pass.
+unsigned int apClientsLast = 0;
+
+/// The current reading, in exactly the field names a `readings` row
+/// uses.
+///
+/// Same names on purpose: the app hands this straight to the function
+/// that already parses a Supabase row, so every freshness rule and
+/// per-sensor validity gate it applies to cloud data applies here too,
+/// with no second code path to keep in step.
+String localReadingJson() {
+  StaticJsonDocument<512> doc;
+  doc["device_id"]        = DEVICE_ID;
+  doc["ph"]               = serialized(String(pH, 2));
+  doc["ammonia"]          = serialized(String(ammoniaEstimatedMgL, 2));
+  doc["turbidity"]        = serialized(String(relativeTurbidity, 1));
+  doc["turbidity_status"] = turbidityStatus;
+  doc["water_temp_c"]     = serialized(String(waterTemperature, 1));
+  doc["ambient_temp_c"]   = serialized(String(airTemperature, 1));
+  doc["fan_active"]       = fanActive;
+  doc["fan_percent"]      = (int)((motor2PWM / 255.0) * 100.0);
+  doc["ph_valid"]         = phValid;
+  doc["turbidity_valid"]  = turbidityValid;
+  doc["water_temp_valid"] = waterTempValid;
+  doc["ambient_valid"]    = ambientValid;
+  doc["ammonia_valid"]    = ammoniaValid;
+
+  // No recorded_at. The device has no trustworthy clock while it is
+  // offline -- NTP needs internet -- so the PHONE stamps each reading
+  // with its own clock as it stores it. Sending a made-up time here
+  // would be worse than sending none.
+  String out;
+  serializeJson(doc, out);
+  return out;
+}
+
+void handleApiLive() {
+  apServer.sendHeader("Access-Control-Allow-Origin", "*");
+  apServer.send(200, "application/json", localReadingJson());
+}
+
+void handleApiStatus() {
+  StaticJsonDocument<384> doc;
+  doc["device_id"]   = DEVICE_ID;
+  doc["firmware"]    = FIRMWARE_VERSION;
+  doc["build_tag"]   = FIRMWARE_BUILD_TAG;
+  doc["sta_connected"] = (WiFi.status() == WL_CONNECTED);
+  doc["ap_active"]   = apActive;
+  doc["ap_clients"]  = WiFi.softAPgetStationNum();
+  doc["uptime_s"]    = (unsigned long)(millis() / 1000);
+  // So the app can tell "the device is fine, it just has no WiFi" from
+  // "the device is in trouble".
+  doc["free_heap"]   = ESP.getFreeHeap();
+
+  String out;
+  serializeJson(doc, out);
+  apServer.sendHeader("Access-Control-Allow-Origin", "*");
+  apServer.send(200, "application/json", out);
+}
+
+/// AP SSID, unique per board so two units never collide and the app can
+/// recognise one by prefix.
+String apSsid() {
+  String mac = WiFi.macAddress();      // AA:BB:CC:DD:EE:FF
+  mac.replace(":", "");
+  return "CRX-Pulse-" + mac.substring(6);
+}
+
+void startAccessPoint() {
+  if (apActive) return;
+
+  // AP_STA, not AP: the station must keep retrying the real WiFi while
+  // the AP serves, or the device could never come back online on its
+  // own.
+  WiFi.mode(WIFI_AP_STA);
+  const String ssid_ap = apSsid();
+
+  if (!WiFi.softAP(ssid_ap.c_str(), AP_PASSWORD)) {
+    Serial.println("[AP] softAP() failed");
+    return;
+  }
+  apActive = true;
+  apClientsLastSeen = millis();
+
+  if (!apServerStarted) {
+    apServer.on("/api/live",   HTTP_GET, handleApiLive);
+    apServer.on("/api/status", HTTP_GET, handleApiStatus);
+    apServer.onNotFound([]() {
+      apServer.send(404, "application/json", "{\"error\":\"no such route\"}");
+    });
+    apServer.begin();
+    apServerStarted = true;
+  }
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("OFFLINE ACCESS POINT UP");
+  Serial.print("  SSID:     "); Serial.println(ssid_ap);
+  Serial.print("  Address:  http://"); Serial.println(WiFi.softAPIP());
+  Serial.println("  Join it from the phone, then open the app.");
+  Serial.println("================================");
+}
+
+void stopAccessPoint() {
+  if (!apActive) return;
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  apActive = false;
+  Serial.println("[AP] offline access point down - WiFi is back");
+}
+
+/// Called every loop pass. Raises the AP when the station has been down
+/// for AP_FALLBACK_AFTER_MS, and takes it away again once WiFi is back
+/// and nobody is using it.
+void serviceAccessPoint() {
+  const unsigned long now = millis();
+  const bool staUp = (WiFi.status() == WL_CONNECTED);
+
+  // Hoisted out of the branch below so the LED and the log can see it
+  // too. softAPgetStationNum() has no side effects and reads 0 while the
+  // AP is down, so asking here rather than inside the else branch
+  // leaves every decision underneath exactly as it was.
+  const unsigned int apClients = apActive ? WiFi.softAPgetStationNum() : 0;
+
+  if (staUp) {
+    staDownSince = 0;
+  } else if (staDownSince == 0) {
+    staDownSince = now;                       // start the 5 s clock
+  }
+
+  if (!apActive) {
+    if (!staUp && (now - staDownSince >= AP_FALLBACK_AFTER_MS)) {
+      startAccessPoint();
+    }
+  } else {
+    if (apClients > 0) {
+      apClientsLastSeen = now;                // somebody is attached
+    }
+    // Only ever withdraw it when the real WiFi can take over AND the
+    // phone has had time to notice.
+    if (staUp && (now - apClientsLastSeen >= AP_LINGER_AFTER_STA_MS)) {
+      stopAccessPoint();
+    }
+  }
+
+  // ---- WiFi LED ------------------------------------------------------
+  // The LED's meaning widens from "the tank WiFi is up" to "this device
+  // has a link that can carry its readings": the tank WiFi, or a phone
+  // joined to the offline access point.
+  //
+  // checkWiFi() has already driven this pin from the station's state by
+  // the time we get here -- loop() calls serviceAccessPoint() directly
+  // after it -- so writing HIGH here only ever ADDS a reason for the LED
+  // to be lit. checkWiFi() itself is untouched, and when neither link
+  // exists the pin simply keeps the LOW it just wrote.
+  if (apClients > 0) digitalWrite(WIFI_LED_PIN, HIGH);
+
+  if (apClients != apClientsLast) {
+    if (apClientsLast == 0) {
+      Serial.print("[AP] phone joined - LED on, ");
+      Serial.print(apClients);
+      Serial.println(" client(s). Open the app to read the tank.");
+    } else if (apClients == 0) {
+      Serial.println("[AP] last client left - LED follows the tank WiFi again");
+    } else {
+      Serial.print("[AP] clients now ");
+      Serial.println(apClients);
+    }
+    apClientsLast = apClients;
+  }
+
+  if (apActive) apServer.handleClient();
+}
+
 void startWiFi() {
   Serial.println();
   Serial.println("================================");
@@ -1599,21 +1830,21 @@ void controlCoolingMotor() {
 
 
 // =====================================================
-// DC ROTATOR (Motor 1) — runs after each feed
+// DC ROTATOR (Motor 1) — runs before each feed
 // =====================================================
 
-/// Run the rotator at [pwm] for [ms], then stop. [pwm] comes from the
-/// app's rotator-speed selection; 0 means "do not rotate at all", which
-/// is a legitimate choice for a feed.
-/// Start the post-feed rotation and return immediately. The feed is
-/// only finished once serviceRotator() stops the motor, so
-/// feedInProgress stays true until then.
+/// Run the rotator at [pwm] for [ms] and return immediately. [pwm] comes
+/// from the app's rotator-speed selection; 0 means "do not rotate at all",
+/// which is a legitimate choice for a feed.
+/// This is the first phase of the feed. serviceRotator() stops the motor
+/// and hands over to beginServoPhase(), so feedInProgress stays set until
+/// the servo has dispensed.
 void startRotator(unsigned long ms, int pwm) {
   pwm = constrain(pwm, 0, 255);
 
   if (pwm == 0 || ms == 0) {
     logLine("[Feed] Rotator -> skipped (speed set to Off)");
-    finishFeed();
+    beginServoPhase(false);
     return;
   }
 
@@ -1627,7 +1858,8 @@ void startRotator(unsigned long ms, int pwm) {
   if (rotatorStopAt == 0) rotatorStopAt = 1;
 }
 
-/// Stop the rotator once its deadline passes. Called every loop pass.
+/// Stop the rotator once its deadline passes, then start the servo phase.
+/// Called every loop pass.
 void serviceRotator() {
   if (rotatorStopAt == 0) return;
   if ((long)(millis() - rotatorStopAt) < 0) return;
@@ -1636,6 +1868,27 @@ void serviceRotator() {
   motor1PWM = 0;
   analogWrite(MOTOR1_EN, motor1PWM);
   logLine("[Feed] Rotator -> OFF");
+  beginServoPhase(true);
+}
+
+/// Second phase of a feed: dispense from the servo, then release the lock.
+/// [afterRotation] keeps the settle pause only when the motor actually ran.
+void beginServoPhase(bool afterRotation) {
+  if (afterRotation) {
+    logLine("[Feed] Settling 1.5 s before dispensing...");
+    lcd.setCursor(0, 1);
+    lcd.print("Settling...  ");
+    delay(FeedController::SETTLE_MS);
+  }
+
+  lcd.setCursor(0, 1);
+  lcd.print("Dispensing...");
+  myServo.write(ServoConfig::OPEN_ANGLE);
+  servoPosition = ServoConfig::OPEN_ANGLE;
+  delay(feedOpenMs);
+  myServo.write(ServoConfig::CLOSED_ANGLE);
+  servoPosition = ServoConfig::CLOSED_ANGLE;
+
   finishFeed();
 }
 
@@ -1709,7 +1962,7 @@ void checkTestTimeouts() {
 
 
 // =====================================================
-// FEED CYCLE: servo drop -> settle -> rotate
+// FEED CYCLE: rotate -> settle -> servo drop
 // =====================================================
 
 void doFeed(int grams, int rotatorPwm) {
@@ -1724,41 +1977,26 @@ void doFeed(int grams, int rotatorPwm) {
   ComponentSafetyTestTimers::servoOpenedAt = 0;
   ComponentSafetyTestTimers::motorStartedAt = 0;
 
-  unsigned long openMs = ServoConfig::openMsForGrams(grams);
+  feedOpenMs = ServoConfig::openMsForGrams(grams);
 
   logLine("[Feed] Dispensing " + String(grams) + " g  (open " +
-          String(openMs) + " ms, rotator " +
+          String(feedOpenMs) + " ms, rotator " +
           String((int)((constrain(rotatorPwm, 0, 255) / 255.0) * 100)) + "%)");
 
-  // The whole cycle blocks for up to ~6 s, so the LCD would otherwise
-  // sit frozen on whatever page it happened to be showing. Say what is
-  // happening instead — this is the one moment the machine moves.
+  // The LCD would otherwise sit frozen on whatever page it happened to
+  // be showing. Say what is happening instead — this is the one moment
+  // the machine moves. The servo phase updates the second line later.
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("Feeding ");
   lcd.print(grams);
   lcd.print("g");
   lcd.setCursor(0, 1);
-  lcd.print("Dispensing...");
+  lcd.print("Rotating...");
 
-  // 1-3: servo opens, holds for the gram time, closes.
-  myServo.write(ServoConfig::OPEN_ANGLE);
-  servoPosition = ServoConfig::OPEN_ANGLE;
-  delay(openMs);
-  myServo.write(ServoConfig::CLOSED_ANGLE);
-  servoPosition = ServoConfig::CLOSED_ANGLE;
-
-  // 4: wait for the feed to drop.
-  logLine("[Feed] Settling 1.5 s before rotating...");
-  lcd.setCursor(0, 1);
-  lcd.print("Settling...  ");
-  delay(FeedController::SETTLE_MS);
-
-  // 5: start the rotation and return. serviceRotator() stops the
-  // motor when its deadline passes and clears feedInProgress then —
-  // loop() keeps running throughout, so the cloud layer stays alive.
-  lcd.setCursor(0, 1);
-  lcd.print("Rotating...  ");
+  // The long spin is deadline-driven, so loop() keeps serving WiFi and
+  // cloud while the motor runs. serviceRotator() starts the servo phase
+  // when the motor stops; finishFeed() releases the lock after that.
   startRotator(FeedController::ROTATOR_RUN_MS, rotatorPwm);
 }
 
@@ -2009,9 +2247,9 @@ void checkScheduledFeeding() {
     if (strcmp(schedules[i].time, now) == 0) {
       logLine("[Schedule] " + String(now) + " -> feed " +
               String(schedules[i].grams) + " g");
-      lastFedMinuteOfDay = minuteOfDay;   // claim the minute BEFORE the
-                                          // blocking feed, so two rows at
-                                          // the same HH:MM cannot double-feed
+      lastFedMinuteOfDay = minuteOfDay;   // claim the minute BEFORE starting
+                                          // the cycle, so two rows at the
+                                          // same HH:MM cannot double-feed
       doFeed(schedules[i].grams, schedules[i].rotatorPwm);
       return;
     }
@@ -2351,9 +2589,15 @@ void setup() {
 
 void loop() {
   checkWiFi();
+
+  // Raise / withdraw the offline access point and serve its API. Placed
+  // right after checkWiFi() so it reacts in the same pass that the
+  // station state changes.
+  serviceAccessPoint();
+
   checkSerialCommand();
 
-  // Stop the post-feed rotation when its deadline passes.
+  // Stop the pre-feed rotation and hand over to the servo phase.
   serviceRotator();
 
   // Keep pushing the ADC block forward for as long as the rotator is
