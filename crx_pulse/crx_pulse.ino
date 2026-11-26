@@ -600,16 +600,15 @@ class PhCalibration {
   }
 };
 
-// One median-of-15 sample per sensor pass rejects spikes; the slow EMA
-// and 0.02 pH deadband stop ADC noise moving the last displayed digit.
+// One median-of-15 sample per sensor pass rejects spikes; the jump guard
+// holds an unconfirmed jump and the 0.02 pH deadband stops ADC noise moving
+// the last displayed digit without easing a real change over many passes.
 class PhFilterConfig {
  public:
   static const int SAMPLE_COUNT = 15;
-  static constexpr float SMOOTHING = 0.15f;
   static constexpr float MIN_CHANGE = 0.02f;
 };
-SensorFilters::StableValue phFilter(PhFilterConfig::SMOOTHING,
-                                     PhFilterConfig::MIN_CHANGE);
+SensorFilters::SnapValue phFilter(PhFilterConfig::MIN_CHANGE);
 SensorFilters::JumpGuard phJumpGuard;
 
 
@@ -1908,8 +1907,9 @@ void readSensors() {
 
   // ---------------- pH (3-point) ----------------------
   // Bench parity, as for turbidity above: crx_pulse_test.ino converts
-  // and reports unconditionally, with no rail check. The median/EMA
-  // live in phFilter, so filtering cannot shift the buffer mapping.
+  // and reports unconditionally, with no rail check. The median, jump
+  // guard and snap publish live after calibration, so filtering cannot
+  // shift the buffer mapping.
   phValid = true;
   pH = phFilter.update(phJumpGuard.update(PhCalibration::valueOf(phCh.sensorVolts)));
 
