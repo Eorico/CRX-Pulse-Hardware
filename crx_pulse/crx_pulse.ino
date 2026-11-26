@@ -23,8 +23,10 @@
  *  ---------------------------------------------------------------
  *  PARITY WITH THE BENCH SKETCH (crx_pulse_test.ino)
  *  ---------------------------------------------------------------
- *  Every sensor formula and calibration constant below is byte-for-byte
- *  the bench sketch's. Where this firmware HAD drifted from the bench
+ *  Every sensor formula and calibration constant below matches the
+ *  bench sketch's. The production build additionally filters pH with a
+ *  median and a slow EMA so ADC noise cannot move the displayed digit.
+ *  Where this firmware HAD drifted from the bench
  *  logic, it has been brought back in line:
  *
  *   1. LAST-GOOD SENSOR VALUES. The bench sketch only ever overwrites
@@ -137,10 +139,16 @@
 #include <ArduinoJson.h>
 #include <time.h>
 #include <DHT.h>
+#include "schedule_dates.h"
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <LiquidCrystal_I2C.h>
 #include <ESP32Servo.h>
+#include <Preferences.h>
+#include <sys/time.h>
+#include "offline_schedule_store.h"
+#include "sensor_filters.h"
+#include "turbidity_calibration.h"
 
 
 // =====================================================
@@ -190,7 +198,7 @@ const unsigned long WIFI_RETRY_INTERVAL = 10000;
 
 // Short build tag shown in the app's Device Setup screen. Kept here rather
 // than in secrets.h so it can change without touching credentials.
-static const char* FIRMWARE_BUILD_TAG = "2026.11.23-motor-first";
+static const char* FIRMWARE_BUILD_TAG = "2026.11.24-sensor-calibration";
 
 // How often the ESP32 pushes a reading to Supabase, and polls for
 // commands / schedules. These are the CLOUD cadences; the LCD and the
@@ -266,6 +274,7 @@ bool timeSynced = false;
 #define MAX_SCHEDULES 12
 struct FeedSchedule {
   char time[6];   // "HH:MM"
+  char date[11];  // "YYYY-MM-DD"; empty = legacy every-day schedule
   int  grams;
   int  rotatorPwm;
   bool active;
@@ -273,7 +282,15 @@ struct FeedSchedule {
 
 FeedSchedule schedules[MAX_SCHEDULES];
 int scheduleCount = 0;
-int lastFedMinuteOfDay = -1;   // prevents double-firing within the same minute
+// The last schedule set Supabase sent us, kept across an offline reboot.
+Preferences schedulePrefs;
+// "YYYY-MM-DD HH:MM": the same wall-clock time on two dates is two feeds.
+char lastFedKey[17] = "";
+char lastScheduleDate[11] = "";
+// A failed midnight refresh must not turn the 1 Hz schedule check into a
+// stream of 10 s cloud requests. Retry at the ordinary 60 s poll cadence.
+unsigned long lastScheduleDateAttempt = 0;
+const unsigned long SCHEDULE_DATE_RETRY_MS = 60000;
 
 // getLocalTime() blocks while it waits for the clock, so the schedule
 // check runs once a second rather than on every loop pass.
@@ -499,18 +516,18 @@ unsigned long ComponentSafetyTestTimers::motorStartedAt = 0;
 // TURBIDITY CALIBRATION  (SEN0189, no divider)
 // =====================================================
 //
-// Relative turbidity % = (TurbidityCalibration::V_CLEAR - V) / (TurbidityCalibration::V_CLEAR - TurbidityCalibration::V_HIGH) * 100
+// The standard table is a five-point curve. Voltage falls as turbidity
+// rises:
 //
-// The four status bands below are voltage thresholds. Their PERCENT
-// equivalents (which is what the app receives) are:
+//   1.36460 V ->   0.0 %
+//   1.33015 V ->  19.9 %   Clear
+//   1.28065 V ->  48.5 %   Slightly Turbid
+//   1.22865 V ->  78.6 %   Turbid
+//   1.19160 V -> 100.0 %   Highly Turbid
 //
-//   Clear            :   0.0 % .. 19.9 %
-//   Slightly Turbid  :  19.9 % .. 48.5 %
-//   Turbid           :  48.5 % .. 78.6 %
-//   Highly Turbid    :  78.6 % .. 100.0 %
-//
-// The app derives those same numbers from these same constants in
-// lib/core/firmware_spec.dart — keep the two in step.
+// The three middle rows are the published voltage thresholds, so a
+// reading on a threshold lands in the band named at that row. The app
+// mirrors the curve and the bands in lib/core/firmware_spec.dart.
 
 // The ADC conversion itself, which all three analog sensors wrote out
 // identically.
@@ -533,171 +550,67 @@ class AdcConfig {
 };
 
 
-class TurbidityCalibration {
- public:
-  // ---- Calibration curve, revised 2026-11-08 ----
-  //
-  // Two anchors, measured against the tank rather than against bench
-  // samples:
-  //
-  //   1.770 V ->   0 %   clear water
-  //   1.724 V -> 100 %   fully turbid
-  //
-  // That is the whole scale inside 46 mV, which is a much narrower
-  // working range than the earlier five-level bench set implied. It
-  // supersedes that set: those samples spanned 1.812 V down to 0.967 V,
-  // and anchoring on them put clear tank water at ~41 % ("Slightly
-  // Turbid") and badly turbid water at ~53 % ("Turbid"), neither of
-  // which matched what the water actually looked like.
-  //
-  // Consequences worth knowing, since they are not obvious:
-  //   - anything at or above 1.770 V reads 0 % Clear, which now
-  //     includes the old "Slightly Turbid" (1.796 V) and "Moderate"
-  //     (1.774 V) bench samples;
-  //   - anything at or below 1.724 V reads 100 % Highly Turbid, which
-  //     now includes the old "Turbid" bench sample (1.681 V) as well
-  //     as the old "Highly Turbid" one (0.967 V).
-  //
-  // Still a table rather than two constants: re-measuring an
-  // intermediate level later is a row here, not a change to the
-  // formula. With two rows percentOf() is a straight line, which is
-  // all 46 mV of range can honestly support.
-  static const int POINT_COUNT = 2;
-  static const float V_POINTS[POINT_COUNT];    // volts, DESCENDING
-  static const float PCT_POINTS[POINT_COUNT];  // matching percentages
-
-  // Kept as names because the serial diagnostics and the app refer to
-  // the two ends of the curve.
-  static constexpr float V_CLEAR = 1.770;   //   0.00 % relative turbidity
-  static constexpr float V_HIGH  = 1.724;   // 100.00 % relative turbidity
-
-  // ---- The standard relative-turbidity bands ----
-  //
-  // These are now stated directly as PERCENT rather than derived from
-  // voltage thresholds. The status is decided from the percentage the
-  // curve above produces, so the status bands and the published
-  // percentage can no longer disagree -- which they could when one was
-  // computed from volts and the other from percent.
-  //
-  // Clear is BELOW 19.94, not at-or-below: the standard reads
-  // "0 -< 19.94%", so 19.94 itself is already Slightly Turbid.
-  static constexpr float CLEAR_MAX    = 19.94;
-  static constexpr float SLIGHTLY_MAX = 48.53;
-  static constexpr float TURBID_MAX   = 78.58;
-
-  // Outside this ADC band the input is sitting on a rail. See
-  // printSensorData(), which notes which rail. Deliberately just
-  // inside each: a powered sensor never reaches 0.016 V or 3.284 V.
-  static const int ADC_MIN_VALID = 20;    // 0.016 V -- held at ground
-  static const int ADC_MAX_VALID = 4075;  // 3.284 V -- railed high
-
-  /// Relative turbidity % for a pin voltage, by interpolation along
-  /// the table above. Flat at 0 / 100 outside the measured ends.
-  static float percentOf(float volts) {
-    if (volts >= V_POINTS[0])              return 0.0;
-    if (volts <= V_POINTS[POINT_COUNT - 1]) return 100.0;
-
-    for (int i = 0; i < POINT_COUNT - 1; i++) {
-      const float vHi = V_POINTS[i];
-      const float vLo = V_POINTS[i + 1];
-      if (volts <= vHi && volts >= vLo) {
-        return PCT_POINTS[i] +
-               (vHi - volts) * (PCT_POINTS[i + 1] - PCT_POINTS[i]) / (vHi - vLo);
-      }
-    }
-    return 100.0;
-  }
-
-  /// One ladder, used by the serial print and the LCD. Takes the
-  /// PERCENTAGE, so it cannot drift from the published number.
-  static const char* statusOf(float percent) {
-    if (percent <  CLEAR_MAX)    return "Clear";
-    if (percent <= SLIGHTLY_MAX) return "Slightly Turbid";
-    if (percent <= TURBID_MAX)   return "Turbid";
-    return "Highly Turbid";
-  }
-};
-const float TurbidityCalibration::V_POINTS[TurbidityCalibration::POINT_COUNT] =
-    { 1.770, 1.724 };
-const float TurbidityCalibration::PCT_POINTS[TurbidityCalibration::POINT_COUNT] =
-    { 0.0, 100.0 };
-
-// Outside this ADC band the input is sitting on a rail, which is a
-// wiring or power fault rather than a turbidity reading — see the
-// validity check in readSensors(). Deliberately just inside each rail:
-// a powered sensor's output never reaches 0.016 V or 3.284 V, so these
-// catch a fault without ever rejecting a real measurement.
-//
-// NOTE: these bound the plausible range only. They do not touch the
-// calibration above, which is still the OLD sensor's: TurbidityCalibration::V_CLEAR 1.3646 /
-// TurbidityCalibration::V_HIGH 1.1916 leaves just 215 of 4095 counts usable, so a replacement
-// probe will read saturated until those two are measured again.
+// These bound only the rail diagnostic in printSensorData(); they do
+// not clamp the curve. Both rails are still reported as 0 / 100 %, as
+// the bench sketch does.
 
 
 // =====================================================
-// pH CALIBRATION  (3-point, carried over from the bench sketch)
+// pH CALIBRATION  (3-point, explicit buffer standards)
 // =====================================================
 //
-// Replace with YOUR measured buffer voltages if you recalibrate.
+// The buffers are named by their standard values, not by a formula
+// that assumes 7.00 / 4.00:
+//
+//   buffer    true pH   probe volts
+//   neutral      6.86      1.950
+//   acid         4.01      2.447
+//   base         9.18      1.425
+//
+// Voltages are reconstructed probe output (pin voltage x 2 divider).
+// The app records the same three constants so its reference test can
+// catch drift between the two.
 class PhCalibration {
  public:
-  // ---- 3-point calibration, measured 2026-11-06 ----
-  //
-  // The buffer pH values are constants now, not literals baked into
-  // the formula. That was the real error: the formula hard-coded 7.00
-  // and 4.00 as the anchor pH values, but the buffers actually used
-  // are 6.78 and 4.05. So even with the right voltages the curve was
-  // anchored to the wrong pH, and the readings came out high by about
-  // a full unit at neutral.
-  //
-  // Measured probe voltages are the outlier-trimmed means of ten reads
-  // per buffer. Dropped as >2 sd from their group: 2.295 V in the acid
-  // set, 1.401 V in the base set.
-  //
-  //   buffer    true pH   probe volts
-  //   neutral      6.78      1.7567
-  //   acid         4.05      2.3891
-  //   base         9.18      1.2754
-  //
-  // Voltages are the RECONSTRUCTED probe output, i.e. after the pin
-  // reading has been multiplied back up by DIVIDER_RATIO.
-  static constexpr float PH_NEUTRAL = 6.78;
-  static constexpr float PH_ACID    = 4.05;
-
-  // The base buffer's standard is quoted as a range, 9.18 - 9.23
-  // (it shifts with temperature). Anchoring at the bottom of that
-  // range puts the measured mean at 9.18, which is inside it.
+  static constexpr float PH_NEUTRAL = 6.86;
+  static constexpr float PH_ACID    = 4.01;
   static constexpr float PH_BASE    = 9.18;
 
-  // Not const: these are what you change when you recalibrate.
-  static float V_NEUTRAL;
-  static float V_ACID;
-  static float V_BASE;
+  static constexpr float V_PH7 = 1.950;  // voltage_pH7, 6.86 buffer
+  static constexpr float V_PH4 = 2.447;  // voltage_pH4, 4.01 buffer
+  static constexpr float V_PH9 = 1.425;  // voltage_pH9, 9.18 buffer
 
   static constexpr float DIVIDER_RATIO = 2.0;
 
   /// Two-segment interpolation about the neutral point.
   ///
-  /// Two segments rather than one line because the electrode's
-  /// sensitivity is not symmetric: 231.7 mV per pH on the acid side
-  /// against 200.5 mV per pH on the base side, a 16% difference. A
-  /// single straight fit through all three buffers would miss the
-  /// outer two by roughly 0.2 pH.
+  /// The electrode's sensitivity is not symmetric: about 174 mV per pH
+  /// on the acid side against 226 mV per pH on the base side. A single
+  /// straight fit through all three buffers would miss the outer ones.
   static float valueOf(float probeVolts) {
     float pH;
-    if (probeVolts >= V_NEUTRAL) {
-      pH = PH_NEUTRAL + (probeVolts - V_NEUTRAL) * (PH_ACID - PH_NEUTRAL) /
-                        (V_ACID - V_NEUTRAL);
+    if (probeVolts >= V_PH7) {
+      pH = PH_NEUTRAL + (probeVolts - V_PH7) * (PH_ACID - PH_NEUTRAL) /
+                        (V_PH4 - V_PH7);
     } else {
-      pH = PH_NEUTRAL + (probeVolts - V_NEUTRAL) * (PH_BASE - PH_NEUTRAL) /
-                        (V_BASE - V_NEUTRAL);
+      pH = PH_NEUTRAL + (probeVolts - V_PH7) * (PH_BASE - PH_NEUTRAL) /
+                        (V_PH9 - V_PH7);
     }
     return constrain(pH, 0.0, 14.0);
   }
 };
-float PhCalibration::V_NEUTRAL = 1.7567;   // 6.78 buffer
-float PhCalibration::V_ACID    = 2.3891;   // 4.05 buffer
-float PhCalibration::V_BASE    = 1.2754;   // 9.18 buffer
+
+// One median-of-15 sample per sensor pass rejects spikes; the slow EMA
+// and 0.02 pH deadband stop ADC noise moving the last displayed digit.
+class PhFilterConfig {
+ public:
+  static const int SAMPLE_COUNT = 15;
+  static constexpr float SMOOTHING = 0.15f;
+  static constexpr float MIN_CHANGE = 0.02f;
+};
+SensorFilters::StableValue phFilter(PhFilterConfig::SMOOTHING,
+                                     PhFilterConfig::MIN_CHANGE);
+SensorFilters::JumpGuard phJumpGuard;
 
 
 // =====================================================
@@ -837,10 +750,18 @@ struct AnalogChannel {
   float pinVolts    = 0.0; // what the ESP32 pin measures
   float sensorVolts = 0.0; // reconstructed sensor output
 
-  void sample() {
-    raw         = analogRead(pin);
+  void setFromRaw(int rawCount) {
+    raw         = rawCount;
     pinVolts    = AdcConfig::toVolts(raw);
     sensorVolts = pinVolts * dividerRatio;
+  }
+
+  void sample() { setFromRaw(analogRead(pin)); }
+
+  void sampleMedian(int count) {
+    int samples[SensorFilters::MAX_MEDIAN_SAMPLES];
+    for (int i = 0; i < count; i++) samples[i] = analogRead(pin);
+    setFromRaw(SensorFilters::medianOf(samples, count));
   }
 };
 
@@ -974,6 +895,8 @@ void   startRotator(unsigned long ms, int pwm);
 void   serviceRotator();
 void   beginServoPhase(bool afterRotation);
 void   finishFeed();
+void   servoTest(bool open);
+void   motorTest(int pwm);
 void   logLine(const String& s, bool verbose = false);
 void   flushLogs();
 bool   logStreaming();
@@ -1467,6 +1390,196 @@ void handleApiStatus() {
   apServer.send(200, "application/json", out);
 }
 
+// ---- Offline control surface on the access point --------------------
+//
+// The AP used to serve readings only. These routes let the app do the same
+// jobs it does through Supabase when the tank has no internet at all.
+// Every POST carries device_id so a stranger on 192.168.4.1 cannot drive
+// the actuators.
+
+void sendApReply(int code, const String& payload) {
+  apServer.sendHeader("Access-Control-Allow-Origin", "*");
+  apServer.send(code, "application/json", payload);
+}
+
+/// Every accepted write returns the board's id as well as `ok`, so the app
+/// can tell the tank's acknowledgement from a stranger's 200 response.
+void sendApOk() {
+  StaticJsonDocument<128> doc;
+  doc["ok"] = true;
+  doc["device_id"] = DEVICE_ID;
+  String out;
+  serializeJson(doc, out);
+  sendApReply(200, out);
+}
+
+void handleApiTime() {
+  StaticJsonDocument<128> doc;
+  if (deserializeJson(doc, apServer.arg("plain")) ||
+      doc["device_id"].as<String>() != String(DEVICE_ID)) {
+    sendApReply(400, "{\"error\":\"bad request\"}");
+    return;
+  }
+  const long long epoch = doc["epoch_seconds"].as<long long>();
+  if (epoch <= 0) {
+    sendApReply(400, "{\"error\":\"bad epoch\"}");
+    return;
+  }
+  // configTime() still supplies the UTC+8 offset; the phone only seeds the
+  // UTC epoch, which is all an offline board can know about the time.
+  struct timeval tv;
+  tv.tv_sec = (time_t)epoch;
+  tv.tv_usec = 0;
+  // The app only marks the seed done on a 2xx reply. A firmware-side
+  // failure must not be reported as success, or dated feeds stay silent
+  // while both sides believe the clock was set.
+  if (settimeofday(&tv, nullptr) != 0) {
+    sendApReply(500, "{\"error\":\"clock rejected\"}");
+    return;
+  }
+  timeSynced = true;
+  sendApOk();
+}
+
+void handleApiFeed() {
+  StaticJsonDocument<192> doc;
+  if (deserializeJson(doc, apServer.arg("plain")) ||
+      doc["device_id"].as<String>() != String(DEVICE_ID)) {
+    sendApReply(400, "{\"error\":\"bad request\"}");
+    return;
+  }
+  const int grams = doc["grams"] | 10;
+  const int pwm = doc["rotator_pwm"] | 255;
+  logLine("[AP] feed_now " + String(grams) + " g");
+  doFeed(grams, pwm);
+  sendApOk();
+}
+
+void handleApiCommand() {
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, apServer.arg("plain")) ||
+      doc["device_id"].as<String>() != String(DEVICE_ID)) {
+    sendApReply(400, "{\"error\":\"bad request\"}");
+    return;
+  }
+
+  const String type = doc["type"].as<String>();
+  if (type == "feed_now") {
+    doFeed(doc["grams"] | 10, doc["rotator_pwm"] | 255);
+  } else if (type == "servo_open") {
+    servoTest(true);
+  } else if (type == "servo_close") {
+    servoTest(false);
+  } else if (type == "motor_test") {
+    motorTest(doc["value"] | 0);
+  } else if (type == "log_stream") {
+    long secs = doc["value"] | 0;
+    if (secs <= 0) {
+      logStreamUntil = 0;
+    } else {
+      if (secs > (long)LOG_STREAM_MAX_S) secs = LOG_STREAM_MAX_S;
+      logStreamUntil = millis() + (unsigned long)secs * 1000UL;
+      if (logStreamUntil == 0) logStreamUntil = 1;
+    }
+  } else {
+    sendApReply(400, "{\"error\":\"unknown command\"}");
+    return;
+  }
+  sendApOk();
+}
+
+/// Lets the app show the board's cached feeds while offline. Indices are
+/// part of the reply because every edit/delete is addressed by index.
+void handleApiSchedulesList() {
+  StaticJsonDocument<3072> doc;
+  JsonArray rows = doc.createNestedArray("schedules");
+  for (int i = 0; i < scheduleCount; i++) {
+    JsonObject row = rows.createNestedObject();
+    row["index"] = i;
+    row["time"] = schedules[i].time;
+    // An empty date is the legacy every-day row; send JSON null for it.
+    if (schedules[i].date[0] != '\0') row["feed_date"] = schedules[i].date;
+    row["grams"] = schedules[i].grams;
+    row["rotator_pwm"] = schedules[i].rotatorPwm;
+    row["active"] = schedules[i].active;
+    row["device_id"] = DEVICE_ID;
+  }
+  String out;
+  serializeJson(doc, out);
+  sendApReply(200, out);
+}
+
+void handleApiSchedules() {
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, apServer.arg("plain")) ||
+      doc["device_id"].as<String>() != String(DEVICE_ID)) {
+    sendApReply(400, "{\"error\":\"bad request\"}");
+    return;
+  }
+
+  // An index overwrites one slot (a toggle or an edit); no index appends.
+  const int index = doc["index"] | -1;
+  if (index >= scheduleCount) {
+    sendApReply(400, "{\"error\":\"bad index\"}");
+    return;
+  }
+  if (index < 0 && scheduleCount >= MAX_SCHEDULES) {
+    sendApReply(409, "{\"error\":\"schedule cache full\"}");
+    return;
+  }
+
+  // Validate every field before touching a slot: a bad date must not leave
+  // a half-written row behind when the request is rejected.
+  const String t = doc["time"].as<String>();
+  if (!isValidScheduleTime(t.c_str())) {
+    sendApReply(400, "{\"error\":\"bad time\"}");
+    return;
+  }
+  char nextDate[11] = "";
+  if (!doc["feed_date"].isNull()) {
+    const String d = doc["feed_date"].as<String>();
+    if (!isValidScheduleDate(d.c_str())) {
+      sendApReply(400, "{\"error\":\"bad date\"}");
+      return;
+    }
+    strncpy(nextDate, d.c_str(), sizeof(nextDate) - 1);
+  }
+
+  FeedSchedule& row = index >= 0 ? schedules[index] : schedules[scheduleCount];
+  strncpy(row.time, t.c_str(), 5);
+  row.time[5] = '\0';
+  strncpy(row.date, nextDate, sizeof(row.date) - 1);
+  row.date[sizeof(row.date) - 1] = '\0';
+  row.grams = doc["grams"] | 10;
+  row.rotatorPwm = doc["rotator_pwm"] | 255;
+  row.active = doc["active"] | true;
+  if (index < 0) scheduleCount++;
+  persistSchedules();
+  sendApOk();
+}
+
+void handleApiSchedulesDelete() {
+  StaticJsonDocument<128> doc;
+  if (deserializeJson(doc, apServer.arg("plain")) ||
+      doc["device_id"].as<String>() != String(DEVICE_ID)) {
+    sendApReply(400, "{\"error\":\"bad request\"}");
+    return;
+  }
+  // A missing index must not silently remove slot 0. Match the add/update
+  // handler's -1 default and reject anything outside the cache.
+  const int index = doc["index"] | -1;
+  if (index < 0 || index >= scheduleCount) {
+    sendApReply(400, "{\"error\":\"bad index\"}");
+    return;
+  }
+  for (int i = index; i < scheduleCount - 1; i++) {
+    schedules[i] = schedules[i + 1];
+  }
+  scheduleCount--;
+  persistSchedules();
+  sendApOk();
+}
+
 /// AP SSID, unique per board so two units never collide and the app can
 /// recognise one by prefix.
 String apSsid() {
@@ -1494,6 +1607,12 @@ void startAccessPoint() {
   if (!apServerStarted) {
     apServer.on("/api/live",   HTTP_GET, handleApiLive);
     apServer.on("/api/status", HTTP_GET, handleApiStatus);
+    apServer.on("/api/schedules", HTTP_GET, handleApiSchedulesList);
+    apServer.on("/api/time",   HTTP_POST, handleApiTime);
+    apServer.on("/api/feed",   HTTP_POST, handleApiFeed);
+    apServer.on("/api/command", HTTP_POST, handleApiCommand);
+    apServer.on("/api/schedules", HTTP_POST, handleApiSchedules);
+    apServer.on("/api/schedules/delete", HTTP_POST, handleApiSchedulesDelete);
     apServer.onNotFound([]() {
       apServer.send(404, "application/json", "{\"error\":\"no such route\"}");
     });
@@ -1751,10 +1870,16 @@ void readSensors() {
   // multiply -- the same shape three times, with the conversion
   // constants written out alongside it three times.
   //
-  // Now they are an array walked by one loop. What stays separate
-  // below is only what the voltage MEANS per sensor, which genuinely
-  // does differ.
-  for (int i = 0; i < CH_COUNT; i++) analogChannels[i].sample();
+  // Now they are an array walked by one loop. pH is the one exception
+  // in how they are sampled: its high-impedance signal takes a median
+  // of 15 reads before the same voltage conversion.
+  for (int i = 0; i < CH_COUNT; i++) {
+    if (i == CH_PH) {
+      analogChannels[i].sampleMedian(PhFilterConfig::SAMPLE_COUNT);
+    } else {
+      analogChannels[i].sample();
+    }
+  }
 
   const AnalogChannel& turb = analogChannels[CH_TURBIDITY];
   const AnalogChannel& phCh = analogChannels[CH_PH];
@@ -1783,9 +1908,10 @@ void readSensors() {
 
   // ---------------- pH (3-point) ----------------------
   // Bench parity, as for turbidity above: crx_pulse_test.ino converts
-  // and reports unconditionally, with no rail check.
+  // and reports unconditionally, with no rail check. The median/EMA
+  // live in phFilter, so filtering cannot shift the buffer mapping.
   phValid = true;
-  pH = PhCalibration::valueOf(analogChannels[CH_PH].sensorVolts);
+  pH = phFilter.update(phJumpGuard.update(PhCalibration::valueOf(phCh.sensorVolts)));
 
   // ---------------- MQ-137 ammonia --------------------
 
@@ -2193,23 +2319,78 @@ bool ackCommand(const String& id) {
 
 
 // =====================================================
+// OFFLINE: schedule cache on the board
+// =====================================================
+
+/// Mirror the in-RAM cache into Preferences so the next offline boot still
+/// has the last set of feeds the app successfully synced.
+void persistSchedules() {
+  schedulePrefs.putInt("count", scheduleCount);
+  for (int i = 0; i < scheduleCount; i++) {
+    char slot[64] = {};
+    encodeScheduleSlot(schedules[i].time, schedules[i].date,
+                       schedules[i].grams, schedules[i].rotatorPwm,
+                       schedules[i].active, slot, sizeof(slot));
+    schedulePrefs.putString(("s" + String(i)).c_str(), slot);
+  }
+}
+
+/// Restore the cache at boot. Until the first successful cloud poll this is
+/// the schedule set checkScheduledFeeding() runs from.
+void loadSchedules() {
+  scheduleCount = schedulePrefs.getInt("count", 0);
+  if (scheduleCount < 0) scheduleCount = 0;
+  if (scheduleCount > MAX_SCHEDULES) scheduleCount = MAX_SCHEDULES;
+
+  for (int i = 0; i < scheduleCount; i++) {
+    String key = "s" + String(i);
+    String slot = schedulePrefs.getString(key.c_str(), "");
+    char time[6] = {};
+    char date[11] = {};
+    int grams = 10;
+    int pwm = 255;
+    bool active = true;
+    if (!decodeScheduleSlot(slot.c_str(), time, sizeof(time), date, sizeof(date),
+                            &grams, &pwm, &active)) {
+      scheduleCount = i;   // stop at the first corrupt slot
+      break;
+    }
+    strncpy(schedules[i].time, time, sizeof(schedules[i].time) - 1);
+    schedules[i].time[sizeof(schedules[i].time) - 1] = '\0';
+    strncpy(schedules[i].date, date, sizeof(schedules[i].date) - 1);
+    schedules[i].date[sizeof(schedules[i].date) - 1] = '\0';
+    schedules[i].grams = grams;
+    schedules[i].rotatorPwm = pwm;
+    schedules[i].active = active;
+  }
+  if (scheduleCount > 0) {
+    Serial.print("[Offline] restored ");
+    Serial.print(scheduleCount);
+    Serial.println(" schedule(s) from the board");
+  }
+}
+
+
+// =====================================================
 // CLOUD: refresh feeding schedules
 // =====================================================
 
-void refreshSchedules() {
-  if (WiFi.status() != WL_CONNECTED) return;
+// Returns true only when the cache was rebuilt, so the caller can retry a
+// failed midnight refresh instead of treating the new date as handled.
+bool refreshSchedules() {
+  if (WiFi.status() != WL_CONNECTED) return false;
 
   String url = String(SUPABASE_URL) +
-               "/rest/v1/schedules?select=id,time,grams,rotator_pwm,active"
+               "/rest/v1/schedules?select=id,time,feed_date,grams,rotator_pwm,active"
                "&device_id=eq." + DEVICE_ID + "&active=eq.true";
 
   String body;
   const int code = cloudRequest(url, "GET", "", &body);
-  if (code != 200) return;
+  if (code != 200) return false;
 
   // PostgREST returns a bare JSON array.
-  StaticJsonDocument<2048> doc;
-  if (deserializeJson(doc, body)) return;
+  StaticJsonDocument<3072> doc;
+  if (deserializeJson(doc, body)) return false;
 
   JsonArray arr = doc.as<JsonArray>();
   scheduleCount = 0;
@@ -2218,12 +2399,22 @@ void refreshSchedules() {
     String t = s["time"].as<String>();
     strncpy(schedules[scheduleCount].time, t.c_str(), 5);
     schedules[scheduleCount].time[5] = '\0';
+    // PostgREST returns SQL NULL as JSON null, not the string "null".
+    if (s["feed_date"].isNull()) {
+      schedules[scheduleCount].date[0] = '\0';
+    } else {
+      String d = s["feed_date"].as<String>();
+      strncpy(schedules[scheduleCount].date, d.c_str(), 10);
+      schedules[scheduleCount].date[10] = '\0';
+    }
     schedules[scheduleCount].grams      = s["grams"] | 10;
     schedules[scheduleCount].rotatorPwm = s["rotator_pwm"] | 255;
     schedules[scheduleCount].active     = s["active"] | true;
     scheduleCount++;
   }
   logLine("[Cloud] Schedules loaded: " + String(scheduleCount));
+  persistSchedules();
+  return true;
 }
 
 
@@ -2236,20 +2427,41 @@ void checkScheduledFeeding() {
   if (!getLocalTime(&t, 50)) return;   // clock not ready yet
   timeSynced = true;
 
+  char today[11] = "";
+  formatScheduleDate(t, today, sizeof(today));
+
+  // The 60 s poll may still hold yesterday's rows at midnight. Refresh as
+  // soon as the UTC+8 date changes so a 00:00 feed is not missed. A failed
+  // fetch leaves the date unhandled, but the retry is rate-limited to the
+  // ordinary poll cadence: otherwise a cloud outage would block this 1 Hz
+  // check for 10 s at a time and starve the AP and the sensors.
+  if (strcmp(lastScheduleDate, today) != 0 &&
+      millis() - lastScheduleDateAttempt >= SCHEDULE_DATE_RETRY_MS) {
+    lastScheduleDateAttempt = millis();
+    if (refreshSchedules()) {
+      strncpy(lastScheduleDate, today, sizeof(lastScheduleDate) - 1);
+      lastScheduleDate[sizeof(lastScheduleDate) - 1] = '\0';
+    }
+  }
+
   int minuteOfDay = t.tm_hour * 60 + t.tm_min;
-  if (minuteOfDay == lastFedMinuteOfDay) return;   // already handled this minute
+  char feedKey[17] = "";
+  buildFeedKey(today, minuteOfDay, feedKey, sizeof(feedKey));
+  if (strcmp(feedKey, lastFedKey) == 0) return;   // already handled this minute
 
   char now[6];
   snprintf(now, sizeof(now), "%02d:%02d", t.tm_hour, t.tm_min);
 
   for (int i = 0; i < scheduleCount; i++) {
     if (!schedules[i].active) continue;
+    if (!scheduleMatchesDate(schedules[i].date, today)) continue;
     if (strcmp(schedules[i].time, now) == 0) {
       logLine("[Schedule] " + String(now) + " -> feed " +
               String(schedules[i].grams) + " g");
-      lastFedMinuteOfDay = minuteOfDay;   // claim the minute BEFORE starting
-                                          // the cycle, so two rows at the
-                                          // same HH:MM cannot double-feed
+      strncpy(lastFedKey, feedKey, sizeof(lastFedKey) - 1);
+      lastFedKey[sizeof(lastFedKey) - 1] = '\0';   // claim BEFORE starting,
+                                                   // so two rows at the same
+                                                   // HH:MM cannot double-feed
       doFeed(schedules[i].grams, schedules[i].rotatorPwm);
       return;
     }
@@ -2505,6 +2717,11 @@ void setup() {
   digitalWrite(WIFI_LED_PIN, LOW);
 
   startWiFi();
+
+  // Restore the last synced schedule set before the first cloud poll, so a
+  // board that boots with no WiFi can still feed on time.
+  schedulePrefs.begin("crxsched", false);
+  loadSchedules();
 
   Serial.println();
   Serial.println("================================");
