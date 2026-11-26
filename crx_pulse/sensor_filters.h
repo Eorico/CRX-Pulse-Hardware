@@ -2,8 +2,9 @@
 #define SENSOR_FILTERS_H
 
 // Small, allocation-free filters shared by the ADC readers and their host
-// tests. A median rejects one-off spikes; the EMA plus deadband stops a
-// high-impedance probe's last digit from moving on ADC noise alone.
+// tests. A median rejects one-off spikes; a jump guard holds an unconfirmed
+// change; the deadband keeps a high-impedance probe's last digit still
+// without easing a real change over many passes.
 namespace SensorFilters {
 
 const int MAX_MEDIAN_SAMPLES = 16;
@@ -29,48 +30,41 @@ inline int medianOf(const int* samples, int count) {
   return (ordered[count / 2 - 1] + ordered[count / 2]) / 2;
 }
 
-class StableValue {
+// Publishes the sample in full once it clears the deadband. No ramp: a
+// confirmed change reaches the dashboard in the same pass it arrives.
+class SnapValue {
  public:
-  StableValue(float smoothing, float minChange)
-      : smoothing_(smoothing),
-        minChange_(minChange),
-        filtered_(0.0f),
-        published_(0.0f),
-        initialized_(false) {}
+  explicit SnapValue(float minChange)
+      : minChange_(minChange), published_(0.0f), initialized_(false) {}
 
   float update(float sample) {
     if (!initialized_) {
-      filtered_ = sample;
       published_ = sample;
       initialized_ = true;
       return published_;
     }
 
-    filtered_ += smoothing_ * (sample - filtered_);
-    const float delta = filtered_ > published_ ? filtered_ - published_
-                                               : published_ - filtered_;
-    if (delta >= minChange_) published_ = filtered_;
+    const float delta = sample > published_ ? sample - published_
+                                            : published_ - sample;
+    if (delta >= minChange_) published_ = sample;
     return published_;
   }
 
   float value() const { return published_; }
 
   void reset() {
-    filtered_ = 0.0f;
     published_ = 0.0f;
     initialized_ = false;
   }
 
  private:
-  float smoothing_;
   float minChange_;
-  float filtered_;
   float published_;
   bool initialized_;
 };
 
 // Holds a jump that the next sample does not confirm. Running this before
-// the slow EMA stops one bad pass from starting a ramp towards 9-10 pH.
+// the snap filter stops one bad pass from publishing 9-10 pH.
 class JumpGuard {
   public:
    static constexpr float MAX_IMMEDIATE_CHANGE = 0.5f;

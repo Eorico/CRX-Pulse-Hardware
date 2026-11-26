@@ -11,22 +11,29 @@ int main() {
 
   // First sample seeds the output directly: a filter that eased up from
   // 7.00 would show a wrong pH for the first few seconds after boot.
-  SensorFilters::StableValue stable(0.15f, 0.02f);
-  assert(stable.update(7.00f) == 7.00f);
+  SensorFilters::SnapValue snap(0.02f);
+  assert(snap.update(7.00f) == 7.00f);
+
+  // A real change is published in that same pass, not eased toward over
+  // many passes.
+  assert(snap.update(7.30f) == 7.30f);
+  assert(snap.update(7.31f) == 7.30f);  // still inside the 0.02 deadband
+  assert(snap.update(7.35f) == 7.35f);
+  assert(snap.update(7.32f) == 7.32f);
 
   // One-count ADC jitter must not make the last displayed digit dance.
+  SensorFilters::SnapValue quiet(0.02f);
+  assert(quiet.update(7.00f) == 7.00f);
   for (int i = 0; i < 50; i++) {
     const float sample = (i % 2 == 0) ? 7.01f : 6.99f;
-    assert(stable.update(sample) == 7.00f);
+    assert(quiet.update(sample) == 7.00f);
   }
 
-  // A real change still gets through, but only after it is sustained.
-  for (int i = 0; i < 200; i++) stable.update(7.20f);
-  assert(stable.value() > 7.18f);
-  assert(stable.value() <= 7.20f);
-
-  stable.reset();
-  assert(stable.update(6.86f) == 6.86f);
+  SensorFilters::SnapValue resetSnap(0.02f);
+  assert(resetSnap.update(7.00f) == 7.00f);
+  assert(resetSnap.update(7.30f) == 7.30f);
+  resetSnap.reset();
+  assert(resetSnap.update(10.00f) == 10.00f);
 
   SensorFilters::JumpGuard guard;
   assert(guard.update(7.00f) == 7.00f);
@@ -48,28 +55,20 @@ int main() {
   assert(confirmed.update(10.00f) == 7.00f);
   assert(confirmed.update(10.10f) == 10.10f);
 
-  // bad pass never starts the ramp
+  // one bad pass must never publish the spike, even when the next reading
+  // settles at a value the guard accepts outright
   SensorFilters::JumpGuard badPass;
-  SensorFilters::StableValue badPassEma(0.15f, 0.02f);
-  badPassEma.update(badPass.update(7.00f));
-  assert(badPassEma.update(badPass.update(10.00f)) == 7.00f);
-  assert(badPassEma.update(badPass.update(7.10f)) == 7.00f);
+  SensorFilters::SnapValue badPassSnap(0.02f);
+  badPassSnap.update(badPass.update(7.00f));
+  assert(badPassSnap.update(badPass.update(10.00f)) == 7.00f);
+  assert(badPassSnap.update(badPass.update(7.10f)) == 7.10f);
 
-  // confirmed breach reaches the EMA
+  // a confirmed breach is published in full on the confirming pass
   SensorFilters::JumpGuard realBreach;
-  SensorFilters::StableValue realBreachEma(0.15f, 0.02f);
-  realBreachEma.update(realBreach.update(7.00f));
-  realBreachEma.update(realBreach.update(10.00f));
-  assert(realBreachEma.update(realBreach.update(10.10f)) > 7.00f);
-
-  // noise test still passes through the guard
-  SensorFilters::JumpGuard noisyGuard;
-  SensorFilters::StableValue noisyEma(0.15f, 0.02f);
-  noisyEma.update(noisyGuard.update(7.00f));
-  for (int i = 0; i < 50; i++) {
-    const float sample = (i % 2 == 0) ? 7.01f : 6.99f;
-    assert(noisyEma.update(noisyGuard.update(sample)) == 7.00f);
-  }
+  SensorFilters::SnapValue realBreachSnap(0.02f);
+  realBreachSnap.update(realBreach.update(7.00f));
+  realBreachSnap.update(realBreach.update(10.00f));
+  assert(realBreachSnap.update(realBreach.update(10.10f)) == 10.10f);
 
   return 0;
 }
