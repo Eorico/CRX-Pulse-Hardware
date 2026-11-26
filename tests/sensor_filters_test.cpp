@@ -35,6 +35,14 @@ int main() {
   resetSnap.reset();
   assert(resetSnap.update(10.00f) == 10.00f);
 
+  SensorFilters::SnapValue boundary(0.02f);
+  assert(boundary.update(7.00f) == 7.00f);
+  assert(boundary.update(7.015f) == 7.00f);
+  assert(boundary.update(7.025f) == 7.025f);
+  assert(boundary.value() == 7.025f);
+  assert(boundary.update(7.03f) == 7.025f);
+  assert(boundary.value() == 7.025f);
+
   SensorFilters::JumpGuard guard;
   assert(guard.update(7.00f) == 7.00f);
   assert(guard.update(10.00f) == 7.00f);

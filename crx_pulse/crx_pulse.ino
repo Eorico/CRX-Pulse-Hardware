@@ -1907,9 +1907,9 @@ void readSensors() {
 
   // ---------------- pH (3-point) ----------------------
   // Bench parity, as for turbidity above: crx_pulse_test.ino converts
-  // and reports unconditionally, with no rail check. The median, jump
-  // guard and snap publish live after calibration, so filtering cannot
-  // shift the buffer mapping.
+  // and reports unconditionally, with no rail check. The median runs on
+  // the ADC samples; the jump guard and snap publish run after calibration,
+  // so filtering cannot shift the buffer mapping.
   phValid = true;
   pH = phFilter.update(phJumpGuard.update(PhCalibration::valueOf(phCh.sensorVolts)));
 

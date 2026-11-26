@@ -41,7 +41,7 @@
 - Consumes: `SensorFilters::medianOf`, `SensorFilters::JumpGuard::MAX_IMMEDIATE_CHANGE` (both already in `sensor_filters.h`).
 - Produces: `SensorFilters::SnapValue(float minChange)` with `float update(float sample)`, `float value() const`, and `void reset()`; first sample authoritative, then publish `sample` unchanged when `|sample - published| >= minChange`, otherwise hold the published value.
 
-- [ ] **Step 1: Replace the EMA assertions in `tests/sensor_filters_test.cpp` with snap assertions**
+- [x] **Step 1: Replace the EMA assertions in `tests/sensor_filters_test.cpp` with snap assertions**
 
 Replace the `StableValue stable(...)` block and the two `StableValue` instances in the guard-integration assertions with these assertions (keep all `medianOf` and standalone `JumpGuard` blocks):
 
@@ -49,8 +49,9 @@ Replace the `StableValue stable(...)` block and the two `StableValue` instances 
   SensorFilters::SnapValue snap(0.02f);
   assert(snap.update(7.00f) == 7.00f);
   assert(snap.update(7.30f) == 7.30f);
-  assert(snap.update(7.31f) == 7.31f);
-  assert(snap.update(7.30f) == 7.30f);
+  assert(snap.update(7.31f) == 7.30f);  // still inside the 0.02 deadband
+  assert(snap.update(7.35f) == 7.35f);
+  assert(snap.update(7.32f) == 7.32f);
 
   SensorFilters::SnapValue quiet(0.02f);
   assert(quiet.update(7.00f) == 7.00f);
@@ -65,12 +66,21 @@ Replace the `StableValue stable(...)` block and the two `StableValue` instances 
   resetSnap.reset();
   assert(resetSnap.update(10.00f) == 10.00f);
 
-  // bad pass never starts a published change
+  SensorFilters::SnapValue boundary(0.02f);
+  assert(boundary.update(7.00f) == 7.00f);
+  assert(boundary.update(7.015f) == 7.00f);
+  assert(boundary.update(7.025f) == 7.025f);
+  assert(boundary.value() == 7.025f);
+  assert(boundary.update(7.03f) == 7.025f);
+  assert(boundary.value() == 7.025f);
+
+  // one bad pass must never publish the spike, even when the next reading
+  // settles at a value the guard accepts outright
   SensorFilters::JumpGuard badPass;
   SensorFilters::SnapValue badPassSnap(0.02f);
   badPassSnap.update(badPass.update(7.00f));
   assert(badPassSnap.update(badPass.update(10.00f)) == 7.00f);
-  assert(badPassSnap.update(badPass.update(7.10f)) == 7.00f);
+  assert(badPassSnap.update(badPass.update(7.10f)) == 7.10f);
 
   // confirmed breach reaches the published value on the confirming pass
   SensorFilters::JumpGuard realBreach;
@@ -82,23 +92,23 @@ Replace the `StableValue stable(...)` block and the two `StableValue` instances 
 
 Remove the final noisy-EMA integration loop; the `quiet` loop above replaces it.
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `g++ -std=c++11 -Icrx_pulse tests/sensor_filters_test.cpp -o "$env:TEMP\sensor_filters_test.exe"`
 Expected: compile failure naming `'SnapValue' is not a member of 'SensorFilters'`.
 
-- [ ] **Step 3: Implement `SnapValue` and remove the unused EMA**
+- [x] **Step 3: Implement `SnapValue` and remove the unused EMA**
 
 In `crx_pulse/sensor_filters.h`, delete `class StableValue` (lines 32–70) and add `class SnapValue` in its place with the constructor, `update`, `value`, `reset`, and private fields `minChange_`, `published_`, `initialized_`. Use a manual absolute-difference comparison; do not include `<cmath>`. Update the file's opening comment so it no longer describes an EMA. Leave `JumpGuard` unchanged.
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run:
 `g++ -std=c++11 -Icrx_pulse tests/sensor_filters_test.cpp -o "$env:TEMP\sensor_filters_test.exe"`
 then `& "$env:TEMP\sensor_filters_test.exe"`
 Expected: compile succeeds and the executable exits 0.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crx_pulse/sensor_filters.h tests/sensor_filters_test.cpp docs/superpowers/specs/2026-11-26-ph-snap-on-confirm-design.md docs/superpowers/plans/2026-11-26-ph-snap-on-confirm.md
@@ -117,7 +127,7 @@ git commit -m "fix: snap pH to confirmed reading instead of ramping"
 - Consumes: `SensorFilters::SnapValue(float)` from Task 1.
 - Produces: `phFilter` as a `SnapValue` instance; call shape `phFilter.update(phJumpGuard.update(...))` unchanged.
 
-- [ ] **Step 1: Change the filter config and instance**
+- [x] **Step 1: Change the filter config and instance**
 
 Replace:
 
@@ -135,7 +145,7 @@ SensorFilters::StableValue phFilter(PhFilterConfig::SMOOTHING,
 
 with `SensorFilters::SnapValue phFilter(PhFilterConfig::MIN_CHANGE);`. Edit only those lines; do not touch the calibration block at lines 565–601.
 
-- [ ] **Step 2: Update the pH section comment and keep the call shape**
+- [x] **Step 2: Update the pH section comment and keep the call shape**
 
 In the `// ---------------- pH (3-point) ----------------` comment, change the clause about the EMA so it describes the median, the jump guard, and the snap-to-confirmed publish. Leave the call at line 1914 exactly as:
 
@@ -143,7 +153,7 @@ In the `// ---------------- pH (3-point) ----------------` comment, change the c
   pH = phFilter.update(phJumpGuard.update(PhCalibration::valueOf(phCh.sensorVolts)));
 ```
 
-- [ ] **Step 3: Verify host tests and scope**
+- [x] **Step 3: Verify host tests and scope**
 
 Run all host tests:
 
@@ -155,7 +165,7 @@ Expected: `offline_schedule_store`, `schedule_dates`, `sensor_filters`, `turbidi
 
 Run `git diff -U0 -- crx_pulse/crx_pulse.ino | Select-String '^@@'` and confirm no hunk header starts inside the credential lines near the top of the file (17–19). Run `git diff --check` and confirm no new whitespace error.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crx_pulse/crx_pulse.ino
@@ -170,11 +180,11 @@ git commit -m "Updated: Publish pH as soon as the reading is confirmed"
 
 **Interfaces:** Consumes the commits from Tasks 1 and 2.
 
-- [ ] **Step 1: Fresh whole-change review**
+- [x] **Step 1: Fresh whole-change review**
 
 Have a fresh reviewer check the two commits against the spec and the Review Focus list. It must not open or print `crx_pulse/secrets.h` or the credential block. If it finds a Critical or Important issue, fix it before pushing.
 
-- [ ] **Step 2: Push**
+- [x] **Step 2: Push**
 
 Run: `git status -sb` — confirm the branch is `main` and there are no staged files.
 Run: `git push origin main`
