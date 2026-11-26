@@ -120,7 +120,7 @@ git commit -m "fix: calibrate pH to measured buffer voltages"
 - Consumes: `crx_pulse/ph_calibration.h` from Task 1.
 - Produces: the sketch still calls `PhCalibration::valueOf(phCh.sensorVolts)` at the existing publish line; no call-site change.
 
-- [ ] **Step 1: Add the include**
+- [x] **Step 1: Add the include**
 
 After `#include "turbidity_calibration.h"` at line 151, add:
 
@@ -130,11 +130,11 @@ After `#include "turbidity_calibration.h"` at line 151, add:
 
 Do not read or edit the credential lines near the top of the file.
 
-- [ ] **Step 2: Remove the in-sketch class**
+- [x] **Step 2: Remove the in-sketch class**
 
 Delete the whole existing `class PhCalibration { ... };` block at lines 565–601, including its old comment table. Do not edit the surrounding `PhFilterConfig`, `phFilter`, or `phJumpGuard` declarations.
 
-- [ ] **Step 3: Verify host tests and scope**
+- [x] **Step 3: Verify host tests and scope**
 
 Run all host tests:
 
@@ -146,7 +146,7 @@ Expected: `offline_schedule_store_test`, `ph_calibration_test`, `schedule_dates_
 
 Run `git diff -U0 -- crx_pulse/crx_pulse.ino | Select-String '^@@'` and confirm no hunk header starts inside the credential lines. Run `git diff --check`.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crx_pulse/crx_pulse.ino
