@@ -51,7 +51,6 @@
 Create `tests/ph_calibration_test.cpp`:
 
 ```cpp
-#include <cassert>
 #include <cmath>
 
 // Arduino supplies constrain() in the sketch; this shim lets the host test
@@ -62,14 +61,21 @@ inline float constrain(float value, float low, float high) {
 
 #include "ph_calibration.h"
 
+#define CHECK(condition) \
+  do {                   \
+    if (!(condition)) {  \
+      return 1;          \
+    }                    \
+  } while (0)
+
 int main() {
-  assert(std::fabs(PhCalibration::valueOf(3.715f) - 6.86f) < 1e-5f);
-  assert(std::fabs(PhCalibration::valueOf(3.970f) - 4.01f) < 1e-5f);
-  assert(std::fabs(PhCalibration::valueOf(2.680f) - 9.18f) < 1e-5f);
-  assert(PhCalibration::V_PH4 > PhCalibration::V_PH7);
-  assert(PhCalibration::V_PH7 > PhCalibration::V_PH9);
-  assert(PhCalibration::valueOf(6.000f) == 0.0f);
-  assert(PhCalibration::valueOf(0.000f) == 14.0f);
+  CHECK(std::fabs(PhCalibration::valueOf(3.715f) - 6.86f) < 1e-5f);
+  CHECK(std::fabs(PhCalibration::valueOf(3.970f) - 4.01f) < 1e-5f);
+  CHECK(std::fabs(PhCalibration::valueOf(2.680f) - 9.18f) < 1e-5f);
+  CHECK(PhCalibration::V_PH4 > PhCalibration::V_PH7);
+  CHECK(PhCalibration::V_PH7 > PhCalibration::V_PH9);
+  CHECK(PhCalibration::valueOf(6.000f) == 0.0f);
+  CHECK(PhCalibration::valueOf(0.000f) == 14.0f);
   return 0;
 }
 ```
@@ -165,7 +171,7 @@ git commit -m "Updated: Use measured pH calibration header"
 - Consumes: the same three anchors from Task 1.
 - Produces: `FirmwareSpec.phVoltNeutral = 3.715`, `phVoltAcid = 3.970`, `phVoltBase = 2.680`.
 
-- [ ] **Step 1: Change the test expectations first**
+- [x] **Step 1: Change the test expectations first**
 
 In `test/calibration_test.dart`, replace the three anchor expectations in `anchor voltages are the specified buffer voltages` with:
 
@@ -177,13 +183,13 @@ In `test/calibration_test.dart`, replace the three anchor expectations in `ancho
 
 Keep the `voltage falls as pH rises` ordering test unchanged; the new values still satisfy it.
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `flutter test --reporter compact test/calibration_test.dart`
 
 Expected: three failures showing the old values `1.950`, `2.447`, `1.425`.
 
-- [ ] **Step 3: Update `FirmwareSpec`**
+- [x] **Step 3: Update `FirmwareSpec`**
 
 Replace only:
 
@@ -203,7 +209,7 @@ with:
 
 Do not change the pH buffer constants, alert ranges, or any other field.
 
-- [ ] **Step 4: Run the mobile verification**
+- [x] **Step 4: Run the mobile verification**
 
 Run: `flutter test --reporter compact test/calibration_test.dart`
 Expected: PASS.
@@ -221,7 +227,7 @@ Expected: all listed tests pass.
 
 Check `git status --short`. If Flutter regenerated plugin registrant files, restore them before staging. Stage only the two intended files.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add lib/core/firmware_spec.dart test/calibration_test.dart
