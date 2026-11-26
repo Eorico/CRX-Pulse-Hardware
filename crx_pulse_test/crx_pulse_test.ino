@@ -103,39 +103,33 @@ const unsigned long SERVO_30_GRAMS = 2400;
 // TURBIDITY CALIBRATION
 // =====================================================
 
-// Calibration curve, revised 2026-11-08.
+// The standard table is a five-point curve. Voltage falls as turbidity
+// rises:
 //
-// Two anchors, measured against the tank rather than bench samples:
+//   1.36460 V ->   0.0 %
+//   1.33015 V ->  19.9 %   Clear
+//   1.28065 V ->  48.5 %   Slightly Turbid
+//   1.22865 V ->  78.6 %   Turbid
+//   1.19160 V -> 100.0 %   Highly Turbid
 //
-//   1.770 V ->   0 %   clear water
-//   1.724 V -> 100 %   fully turbid
-//
-// The whole scale inside 46 mV. This supersedes the earlier five-level
-// bench set (1.812 V down to 0.967 V), which put clear tank water at
-// ~41 % "Slightly Turbid" and badly turbid water at ~53 % "Turbid" --
-// neither matching what the water looked like.
-//
-// So: at or above 1.770 V reads 0 % Clear (which now takes in the old
-// "Slightly" 1.796 V and "Moderate" 1.774 V samples), and at or below
-// 1.724 V reads 100 % Highly Turbid (taking in the old "Turbid"
-// 1.681 V as well as "Highly Turbid" 0.967 V).
-//
-// Still a table so a re-measured intermediate level is a row here, not
-// a formula change. With two rows it is a straight line, which is all
-// 46 mV of range can honestly support.
-const int   TURBIDITY_POINTS = 2;
-const float TURBIDITY_V[TURBIDITY_POINTS]   = { 1.770, 1.724 };
-const float TURBIDITY_PCT[TURBIDITY_POINTS] = { 0.0,   100.0 };
+// The three middle rows are the published voltage thresholds, so a
+// reading on a threshold lands in the band named at that row.
+const int   TURBIDITY_POINTS = 5;
+const float TURBIDITY_V[TURBIDITY_POINTS] = {
+  1.36460, 1.33015, 1.28065, 1.22865, 1.19160
+};
+const float TURBIDITY_PCT[TURBIDITY_POINTS] = {
+  0.0, 19.9, 48.5, 78.6, 100.0
+};
 
-const float V_CLEAR = 1.770;   //   0.00% relative turbidity
-const float V_HIGH  = 1.724;   // 100.00% relative turbidity
+const float V_CLEAR = 1.36460;  //   0.00% relative turbidity
+const float V_HIGH  = 1.19160;  // 100.00% relative turbidity
 
-// The standard bands, as PERCENT. The status is decided from the
-// percentage the curve produces, so the band and the published number
-// cannot disagree. "Clear: 0 -< 19.94%", so 19.94 is already Slightly.
-const float TURBIDITY_CLEAR_MAX    = 19.94;
-const float TURBIDITY_SLIGHTLY_MAX = 48.53;
-const float TURBIDITY_TURBID_MAX   = 78.58;
+// Each cut is the TOP of its band, so equality stays in the band the
+// standard names: 19.9 is Clear, 48.5 is Slightly, 78.6 is Turbid.
+const float TURBIDITY_CLEAR_MAX    = 19.9;
+const float TURBIDITY_SLIGHTLY_MAX = 48.5;
+const float TURBIDITY_TURBID_MAX   = 78.6;
 
 // Relative turbidity % for a pin voltage, interpolated along the table.
 float turbidityPercentOf(float volts) {
@@ -153,7 +147,7 @@ float turbidityPercentOf(float volts) {
 }
 
 String turbidityStatusOf(float percent) {
-  if (percent <  TURBIDITY_CLEAR_MAX)    return "Clear";
+  if (percent <= TURBIDITY_CLEAR_MAX)    return "Clear";
   if (percent <= TURBIDITY_SLIGHTLY_MAX) return "Slightly Turbid";
   if (percent <= TURBIDITY_TURBID_MAX)   return "Turbid";
   return "Highly Turbid";
@@ -164,40 +158,37 @@ String turbidityStatusOf(float percent) {
 // pH CALIBRATION
 // =====================================================
 
-// 3-point calibration, measured 2026-11-06.
+// Explicit standard buffers, not a formula that assumes 7.00 / 4.00:
 //
-// The buffer pH values are constants now, not literals inside the
-// formula. That was the real error: the formula anchored the curve at
-// pH 7.00 and 4.00, but the buffers actually used are 6.78 and 4.05,
-// so readings came out about a full unit high at neutral.
+//   buffer    true pH   probe volts
+//   neutral      6.86      1.950
+//   acid         4.01      2.447
+//   base         9.18      1.425
 //
-// Probe voltages are outlier-trimmed means of ten reads per buffer
-// (dropped: 2.295 V from the acid set, 1.401 V from the base set), and
-// are the RECONSTRUCTED probe output, i.e. after PH_DIVIDER_RATIO.
-const float PH_NEUTRAL = 6.78;
-const float PH_ACID    = 4.05;
-
-// The base buffer's standard is a range, 9.18 - 9.23 (it shifts with
-// temperature). Anchoring at 9.18 puts the measured mean inside it.
+// Probe voltages are the RECONSTRUCTED output, i.e. after
+// PH_DIVIDER_RATIO. The production firmware applies a median/EMA filter
+// before calling this curve; the values here are the calibration anchors.
+const float PH_NEUTRAL = 6.86;
+const float PH_ACID    = 4.01;
 const float PH_BASE    = 9.18;
 
-float voltage_pH_neutral = 1.7567;   // 6.78 buffer
-float voltage_pH_acid    = 2.3891;   // 4.05 buffer
-float voltage_pH_base    = 1.2754;   // 9.18 buffer
+const float voltage_pH7 = 1.950;  // 6.86 buffer
+const float voltage_pH4 = 2.447;  // 4.01 buffer
+const float voltage_pH9 = 1.425;  // 9.18 buffer
 
 const float PH_DIVIDER_RATIO = 2.0;
 
-// Two segments, not one line: the electrode is 231.7 mV per pH on the
-// acid side against 200.5 mV per pH on the base side, a 16% asymmetry.
-// A single straight fit would miss the outer buffers by about 0.2 pH.
+// Two segments, not one line: the electrode is about 174 mV per pH on
+// the acid side against 226 mV per pH on the base side. A single
+// straight fit would miss the outer buffers.
 float phValueOf(float probeVolts) {
   float value;
-  if (probeVolts >= voltage_pH_neutral) {
-    value = PH_NEUTRAL + (probeVolts - voltage_pH_neutral) *
-            (PH_ACID - PH_NEUTRAL) / (voltage_pH_acid - voltage_pH_neutral);
+  if (probeVolts >= voltage_pH7) {
+    value = PH_NEUTRAL + (probeVolts - voltage_pH7) *
+            (PH_ACID - PH_NEUTRAL) / (voltage_pH4 - voltage_pH7);
   } else {
-    value = PH_NEUTRAL + (probeVolts - voltage_pH_neutral) *
-            (PH_BASE - PH_NEUTRAL) / (voltage_pH_base - voltage_pH_neutral);
+    value = PH_NEUTRAL + (probeVolts - voltage_pH7) *
+            (PH_BASE - PH_NEUTRAL) / (voltage_pH9 - voltage_pH7);
   }
   return constrain(value, 0.0, 14.0);
 }

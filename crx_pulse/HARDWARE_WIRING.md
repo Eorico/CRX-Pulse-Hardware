@@ -74,7 +74,7 @@ Every analog sensor is on **ADC1**, which is the part that keeps working while W
 | GND | GND |
 
 - **No voltage divider** on this input — the board's output already sits inside the ADC range at the calibrated operating point.
-- Calibration (in the firmware): `V_CLEAR = 1.3646 V` → 0 % relative turbidity, `V_HIGH = 1.1916 V` → 100 %. Note the inversion: **more turbid means a LOWER voltage.**
+- Calibration (in the firmware): `V_CLEAR = 1.3646 V` → 0 % relative turbidity, `V_HIGH = 1.1916 V` → 100 %. Note the inversion: **more turbid means a LOWER voltage.** Conversion is piecewise linear through those ends and the three band edges below.
 - Status bands, as voltages and as the percentages the app receives:
 
   | Status | Voltage | Percent |
@@ -103,6 +103,8 @@ Every analog sensor is on **ADC1**, which is the part that keeps working while W
   | 9.18 | `voltage_pH9` | 1.425 V |
 
   Recalibrate by reading `pH Voltage` from the serial monitor in each buffer and replacing these three numbers.
+
+- Readings are median-sampled (15 ADC reads) and then low-pass filtered with a 0.02 pH deadband, so a stable buffer does not make the last digit flicker. Allow a few seconds for the displayed value to settle after moving probes between buffers.
 
 ## Ammonia Sensor (MQ-137)
 
@@ -251,3 +253,33 @@ pH, ammonia, turbidity and water temperature sit on two electrically independent
 3. **The 4.7kΩ OneWire pull-up missing** — this kills the DS18B20 only, so if pH and ammonia are also dead, look at 1 and 2 first.
 
 The serial monitor prints raw ADC counts and voltages alongside every reading. That tells you immediately whether a sensor is pinned at a rail (wiring) or reading a plausible voltage that converts badly (calibration).
+
+## Offline Control — the Device Access Point
+
+The board stays in `WIFI_AP_STA`: it keeps retrying the router **and** raises its own `CRX-Pulse-XXXXXX` network. Joining that network with the app gives full control even when neither the tank nor the phone has internet.
+
+| Route | Method | Body | Purpose |
+|---|---|---|---|
+| `/api/live` | GET | — | Current reading (existing route) |
+| `/api/status` | GET | — | Device id, firmware, uptime, AP clients (existing route) |
+| `/api/schedules` | GET | — | Cached feeds, each with its index |
+| `/api/time` | POST | `device_id`, `epoch_seconds` | Seed the board clock from the phone |
+| `/api/feed` | POST | `device_id`, `grams`, `rotator_pwm` | Feed now |
+| `/api/command` | POST | `device_id`, `type`, `value?` | Servo/motor test, log stream |
+| `/api/schedules` | POST | `device_id`, `time`, `feed_date?`, `grams`, `rotator_pwm`, `active`, `index?` | Add a feed, or overwrite the one at `index` |
+| `/api/schedules/delete` | POST | `device_id`, `index` | Remove a feed by index |
+
+Every POST must carry the board's actual `DEVICE_ID`; a mismatched id is rejected with 400. Accepted writes reply with `{"ok":true,"device_id":...}` so the app can tell the board from a stranger that happens to answer on `192.168.4.1`.
+
+`time` must be zero-padded `HH:MM` and `feed_date` zero-padded `YYYY-MM-DD`; malformed values are rejected with 400 rather than stored as a feed that can never fire. `/api/schedules/delete` requires an explicit `index` — omitting it is rejected, never taken as slot 0.
+
+### What keeps working with no router
+
+- Sensors, LCD and the temperature-driven fan run exactly as online.
+- Scheduled feeding fires from the board's own cache — the last set of schedules Supabase sent is written to `Preferences` and restored on boot, so a power cut with no WiFi does not lose it.
+- The app reads live values, feeds manually, drives the test actuators and edits schedules over the AP.
+- The app seeds the UTC clock once on first contact (`/api/time`). The firmware still applies its UTC+8 offset, so dated feeds work offline.
+
+**Limitation:** the ESP32 has no battery-backed clock. If it powers up with no router *and* the app never joins its AP to seed the time, the board has no trustworthy date and dated feeds cannot fire — every-day schedules still do. Once seeded, the clock runs until the next power cut.
+
+Firmware build tag for the current build (offline control plus the turbidity/pH calibration update): `2026.11.24-sensor-calibration`.
